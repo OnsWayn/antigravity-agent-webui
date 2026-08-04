@@ -1,0 +1,32 @@
+{
+  "name": "antigravity-agent-webui",
+  "version": "1.4.0",
+  "description": "Local Web UI for Gemini Antigravity managed agents, persistent sessions and sandbox file extraction",
+  "author": "OnsWayn",
+  "license": "Apache-2.0",
+  "keywords": [
+    "gemini",
+    "antigravity",
+    "managed-agent",
+    "interactions-api",
+    "webui",
+    "sandbox"
+  ],
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check database.js && node --check environment-files.js && node --check http-security.js && node --check snapshot-cache.js && node --check public/js/app.js",
+    "verify": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.4",
+    "node-fetch": "^2.7.0",
+    "tar-stream": "^3.2.0"
+  }
+}

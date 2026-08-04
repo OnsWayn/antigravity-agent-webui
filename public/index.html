@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Google Antigravity Agent Web UI (antigravity-preview-05-2026)</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Material Symbols Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" />
+  <!-- Marked.js for Markdown parsing -->
+  <script async src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- DOMPurify for XSS sanitization of rendered markdown -->
+  <script async src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <link rel="stylesheet" href="css/style.css?v=1.4.0">
+</head>
+<body class="dark-theme">
+
+  <!-- Header / Navigation Bar -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-icon">
+        <span class="material-symbols-outlined">auto_awesome</span>
+      </div>
+      <div class="logo-title">
+        <h1>Antigravity Agent Studio</h1>
+        <span class="model-tag">antigravity-preview-05-2026</span>
+      </div>
+    </div>
+    
+    <div class="header-right">
+      <div class="api-key-status" id="apiKeyBadge">
+        <span class="status-dot warning"></span>
+        <span class="status-text">未设置 API Key</span>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="openApiKeyModalBtn">
+        <span class="material-symbols-outlined">key</span>
+        配置 API Key
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Application Container -->
+  <main class="app-container">
+    
+    <!-- Left Panel: Setup & Task Controls -->
+    <aside class="panel config-panel">
+      <div class="panel-header">
+        <h2><span class="material-symbols-outlined">tune</span> 任务配置与会话面板</h2>
+      </div>
+
+      <div class="panel-content scrollable">
+        
+        <!-- 1. 置顶项：Task Prompt Input Section -->
+        <div class="card card-primary">
+          <div class="card-title">
+            <span class="material-symbols-outlined">terminal</span>
+            单次代理任务 Prompt (Input)
+          </div>
+
+          <!-- Prompt Presets -->
+          <div class="form-group">
+            <label>预设任务模板：</label>
+            <div class="preset-pills">
+              <button type="button" class="pill-btn" data-preset="news">📰 新闻汇总导出 PDF</button>
+              <button type="button" class="pill-btn" data-preset="data">📊 分析 CSV 生成图表</button>
+              <button type="button" class="pill-btn" data-preset="code">🐍 构建 Python Web 服务</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <textarea id="taskInput" class="form-control prompt-textarea" rows="4" placeholder="在此输入需要 Antigravity Agent 在远程沙盒中自主执行的多步代理任务..."></textarea>
+          </div>
+
+          <!-- Multimodal Image Attachment -->
+          <div class="form-group">
+            <label class="label-with-action">
+              <span>多模态图片附件 (Optional Image)：</span>
+              <input type="file" id="imageFileInput" accept="image/*" style="display:none">
+              <button type="button" class="btn-text" id="uploadImageBtn">📷 选择图片</button>
+            </label>
+
+            <div id="imagePreviewContainer" class="image-preview-container" style="display:none;">
+              <img id="imagePreview" src="" alt="Preview">
+              <button type="button" class="btn-remove-img" id="removeImageBtn">
+                <span class="material-symbols-outlined">close</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Environment Configuration (Embedded) -->
+          <div class="env-config-section" style="margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border-color);">
+            <div class="card-subtitle" style="font-weight: 600; font-size: 0.88rem; margin-bottom: 10px; color: var(--accent-cyan); display: flex; align-items: center; gap: 6px;">
+              <span class="material-symbols-outlined" style="font-size: 1.1rem;">cloud_sync</span>
+              当前环境配置 (Environment)
+            </div>
+
+            <div class="form-group">
+              <label>环境模式：</label>
+              <div class="radio-group">
+                <label class="radio-label">
+                  <input type="radio" name="envMode" value="new" checked> 新建沙盒 (New Remote)
+                </label>
+                <label class="radio-label">
+                  <input type="radio" name="envMode" value="reuse"> 复用既有 Environment ID
+                </label>
+              </div>
+            </div>
+
+            <div class="form-group" id="envIdGroup" style="display: none;">
+              <label for="envIdInput">当前 Environment ID：</label>
+              <div class="input-with-button">
+                <input type="text" id="envIdInput" placeholder="env-xxxxxx" class="form-control mono">
+                <button class="btn btn-icon" id="copyEnvIdBtn" title="复制当前环境ID">
+                  <span class="material-symbols-outlined">content_copy</span>
+                </button>
+              </div>
+              <label class="checkbox-item" style="margin-top: 8px;">
+                <input type="checkbox" id="reuseFreshSessionCheckbox">
+                <div class="checkbox-content">
+                  <span class="checkbox-title">复用环境，但新建独立会话</span>
+                  <span class="checkbox-desc">共享沙盒文件，不继承上一段对话上下文</span>
+                </div>
+              </label>
+            </div>
+
+            <!-- Initial Sources Injector -->
+            <div class="form-group" id="sourcesGroup">
+              <label class="label-with-action">
+                <span>注入预置文件 (Sources)：</span>
+                <button type="button" class="btn-text" id="addSourceBtn">+ 添加文件</button>
+              </label>
+              <div id="sourcesContainer" class="sources-container">
+                <!-- Dynamically added sources -->
+              </div>
+            </div>
+          </div>
+
+          <!-- Submit Button -->
+          <button class="btn btn-primary btn-block btn-lg" id="runTaskBtn" style="margin-top: 16px;">
+            <span class="material-symbols-outlined">rocket_launch</span>
+            提交代理任务 (Run Agent Interaction)
+          </button>
+        </div>
+
+        <!-- 2. 第二项：Sessions Management Section -->
+        <div class="card card-accent">
+          <div class="card-title label-with-action">
+            <span><span class="material-symbols-outlined">folder_special</span> 历史沙盒会话 (Sessions)</span>
+            <span class="session-create-actions">
+              <button type="button" class="btn-text" id="btnCreateSessionInEnvironment" disabled>+ 当前沙盒新会话</button>
+              <button type="button" class="btn-text" id="btnCreateNewSession">+ 新沙盒</button>
+            </span>
+          </div>
+
+          <div id="sessionsListContainer" class="sessions-list">
+            <!-- Dynamically populated session cards -->
+          </div>
+        </div>
+
+        <!-- 3. Network Proxy Settings Section -->
+        <div class="card">
+          <div class="card-title">
+            <span class="material-symbols-outlined">vpn_lock</span>
+            网络代理配置 (Network Proxy)
+          </div>
+          <div class="form-group">
+            <label class="checkbox-item" style="margin-bottom: 8px;">
+              <input type="checkbox" id="useProxyCheckbox">
+              <div class="checkbox-content">
+                <span class="checkbox-title">启用 HTTP/HTTPS 代理服务</span>
+                <span class="checkbox-desc">解决国内网络环境连接 Google API 失败的问题</span>
+              </div>
+            </label>
+          </div>
+          <div class="form-group" id="proxyUrlGroup" style="display: none;">
+            <label for="proxyUrlInput">代理地址/端口 (Proxy Host:Port)：</label>
+            <input type="text" id="proxyUrlInput" value="http://127.0.0.1:10808" placeholder="http://127.0.0.1:10808" class="form-control mono">
+            <small class="form-hint">默认监听本地端口 10808 (支持如 10808 或 http://127.0.0.1:10808)</small>
+          </div>
+        </div>
+
+        <!-- 5. Model & Budget Section -->
+        <div class="card">
+          <div class="card-title">
+            <span class="material-symbols-outlined">memory</span>
+            模型与 Token 预算
+          </div>
+          <div class="form-group">
+            <label for="modelSelect">基底 Gemini 模型 (agent_config.model)：</label>
+            <select id="modelSelect" class="form-control">
+              <option value="gemini-3.6-flash" selected>Gemini 3.6 Flash (默认 - 推荐)</option>
+              <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite (低成本/轻量)</option>
+              <option value="gemini-3.5-pro">Gemini 3.5 Pro (强推理)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="maxTokensInput">Token 预算上限 (max_total_tokens)：</label>
+            <input type="number" id="maxTokensInput" placeholder="如 50000 (留空为无限制)" class="form-control" min="1000" step="5000">
+            <small class="form-hint">当达到上限时 agent 将中断并返回 `status: incomplete`</small>
+          </div>
+        </div>
+
+        <!-- 6. Tools Configuration Section -->
+        <div class="card">
+          <div class="card-title">
+            <span class="material-symbols-outlined">build</span>
+            启用工具与能力 (Tools)
+          </div>
+          
+          <div class="checkbox-list">
+            <label class="checkbox-item">
+              <input type="checkbox" id="toolCodeExec" checked>
+              <div class="checkbox-content">
+                <span class="checkbox-title">💻 Code Execution (代码执行)</span>
+                <span class="checkbox-desc">在远程 Linux 沙盒中运行 Bash、Python、Node.js 命令行</span>
+              </div>
+            </label>
+
+            <label class="checkbox-item">
+              <input type="checkbox" id="toolGoogleSearch" checked>
+              <div class="checkbox-content">
+                <span class="checkbox-title">🔍 Google Search (谷歌搜索)</span>
+                <span class="checkbox-desc">实时检索互联网最新公开数据与网页信息</span>
+              </div>
+            </label>
+
+            <label class="checkbox-item">
+              <input type="checkbox" id="toolUrlContext" checked>
+              <div class="checkbox-content">
+                <span class="checkbox-title">🌐 URL Context (网页读取)</span>
+                <span class="checkbox-desc">抓取并解析指定 Web 页面内容</span>
+              </div>
+            </label>
+          </div>
+
+          <!-- MCP Servers Section -->
+          <div class="collapsible-section">
+            <button type="button" class="collapsible-toggle" id="mcpToggleBtn">
+              <span><span class="material-symbols-outlined">hub</span> 远程 MCP 服务器配置</span>
+              <span class="material-symbols-outlined icon-arrow">expand_more</span>
+            </button>
+            <div class="collapsible-body" id="mcpBody" style="display: none;">
+              <div class="form-group">
+                <label for="mcpName">MCP 服务标识 (全小写字母/数字)：</label>
+                <input type="text" id="mcpName" placeholder="weather" class="form-control mono">
+              </div>
+              <div class="form-group">
+                <label for="mcpUrl">MCP Endpoint URL：</label>
+                <input type="url" id="mcpUrl" placeholder="https://example.com/mcp" class="form-control mono">
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </aside>
+
+    <!-- Right Panel: Execution Console & Artifact Workspace -->
+    <section class="panel workspace-panel">
+      
+      <!-- Workspace Tabs & Stats Bar -->
+      <div class="workspace-header">
+        <div class="tab-group">
+          <button class="tab-btn active" data-tab="trace">
+            <span class="material-symbols-outlined">analytics</span>
+            Agent 思考与执行轨迹
+          </button>
+          <button class="tab-btn" data-tab="artifacts">
+            <span class="material-symbols-outlined">folder_zip</span>
+            完成产物与远程沙盒下载
+          </button>
+          <button class="tab-btn" data-tab="logs">
+            <span class="material-symbols-outlined">bug_report</span>
+            调试与错误日志 (Logs)
+          </button>
+          <button class="tab-btn" data-tab="docs">
+            <span class="material-symbols-outlined">info</span>
+            功能特性与限制说明
+          </button>
+        </div>
+
+        <div class="execution-stats">
+          <div class="stat-item">
+            <span class="stat-label">状态:</span>
+            <span class="badge badge-idle" id="taskStatusBadge">IDLE</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Token 消耗:</span>
+            <span class="stat-value mono" id="statTokens">0</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">环境 ID:</span>
+            <span class="stat-value mono text-truncate" id="statEnvId">None</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab Content Area -->
+      <div class="workspace-body scrollable">
+        
+        <!-- Tab 1: Trace & Output -->
+        <div class="tab-content active" id="tabTrace">
+          <div class="empty-state" id="emptyStateTrace">
+            <span class="material-symbols-outlined icon-large">smart_toy</span>
+            <h3>尚未运行任何 Agent 任务</h3>
+            <p>在左侧配置任务需求并点击“提交代理任务”，Antigravity Agent 将会在云端 Linux 沙盒中开展自主推理与工具调用。</p>
+          </div>
+
+          <div id="traceContainer" class="trace-container" style="display: none;">
+            <!-- Live agent output rendering -->
+            <div class="output-card">
+              <div class="output-card-header">
+                <span class="material-symbols-outlined">output</span>
+                <span>Agent 最终响应 (Output Text)</span>
+                <button class="btn btn-sm btn-secondary" id="copyOutputBtn">复制文本</button>
+              </div>
+              <div class="markdown-body" id="finalOutputText"></div>
+            </div>
+
+            <!-- Steps & Tool Calls Trace -->
+            <div class="output-card margin-top">
+              <div class="output-card-header">
+                <span class="material-symbols-outlined">list_alt</span>
+                <span>执行步骤与工具调用日志 (Steps Trace)</span>
+              </div>
+              <div id="stepsList" class="steps-list"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 2: Artifacts & Remote File Downloader -->
+        <div class="tab-content" id="tabArtifacts">
+          <!-- 📦 Workspace Pack & Download Card -->
+          <div class="card card-primary">
+            <div class="card-title">
+              <span class="material-symbols-outlined">inventory_2</span>
+              一键打包整个沙盒工作区项目 (Zip Entire Workspace)
+            </div>
+            <p class="card-description">
+              如果 Agent 在远程沙盒中构建了完整的代码工程或生成了多个产物（如 RAR/ZIP/源码文件），点击下方按钮，系统将自动在沙盒中执行 `zip` 将整个 `/workspace` 归档并通过您选择的传输通道下载！
+            </p>
+
+            <div class="form-group" style="margin-bottom: 12px;">
+              <label for="transferProviderSelect">网络传输通道选择 (Transfer Provider)：</label>
+              <select id="transferProviderSelect" class="form-control">
+                <option value="snapshot" selected>✅ Gemini 官方环境快照 (默认、推荐)</option>
+                <option value="chunked">🛡️ 旧版 Agent Base64 分块提取 (备用)</option>
+                <option value="fileio">🔥 file.io (第三方阅后即焚网盘)</option>
+                <option value="catbox">🐱 catbox.moe (第三方长期网盘)</option>
+              </select>
+              <label class="checkbox-item" style="margin-top: 8px;">
+                <input type="checkbox" id="forceRefreshSnapshotCheckbox">
+                <div class="checkbox-content">
+                  <span class="checkbox-title">强制刷新环境快照</span>
+                  <span class="checkbox-desc">默认缓存 60 秒；环境在其他客户端被修改时可勾选</span>
+                </div>
+              </label>
+            </div>
+
+            <button class="btn btn-primary" id="btnZipWorkspace">
+              <span class="material-symbols-outlined">folder_zip</span>
+              📦 一键打包沙盒 `/workspace` 为 ZIP 并下载
+            </button>
+          </div>
+
+          <div class="card card-accent margin-top">
+            <div class="card-title">
+              <span class="material-symbols-outlined">download_for_offline</span>
+              按路径提取/下载单个沙盒文件 (Single File Downloader)
+            </div>
+            <p class="card-description">
+              官方快照方式既支持完整路径，也支持只输入文件名自动定位（如 `flowchart.svg`）。如果存在多个同名文件，系统会列出完整路径供您选择。
+            </p>
+
+            <div class="fetch-file-form">
+              <div class="form-group flex-1">
+                <label for="fetchFilePathInput">沙盒文件路径或文件名：</label>
+                <input type="text" id="fetchFilePathInput" placeholder="/workspace/report.svg 或 report.svg" class="form-control mono">
+              </div>
+              <button class="btn btn-secondary" id="fetchFileBtn">
+                <span class="material-symbols-outlined">download</span>
+                获取并下载该文件
+              </button>
+            </div>
+
+            <div id="fetchFileStatus" class="fetch-status-box" style="display: none;"></div>
+          </div>
+
+          <!-- Detected Artifacts List -->
+          <div class="output-card margin-top">
+            <div class="output-card-header">
+              <span class="material-symbols-outlined">find_in_page</span>
+              <span>自动感知的产物文件列表 (Detected Artifacts)</span>
+            </div>
+            <div id="detectedArtifactsList" class="detected-artifacts-list">
+              <div class="empty-hint">Agent 运行完成后将自动提取可能生成的文件列表。</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: Real-time Debug Console & API Logs -->
+        <div class="tab-content" id="tabLogs">
+          <div class="card card-accent">
+            <div class="card-title label-with-action">
+              <span><span class="material-symbols-outlined">terminal</span> API 请求与系统调试日志 (Debug Console)</span>
+              <div>
+                <button class="btn btn-sm btn-secondary" id="clearLogsBtn">清空日志</button>
+                <button class="btn btn-sm btn-secondary" id="copyLogsBtn">复制全量日志</button>
+              </div>
+            </div>
+            <p class="card-description">实时记录与 Gemini API 的完整通信数据、HTTP 响应码、Payload 详情以及异常堆栈 Trace。</p>
+
+            <div id="debugLogsViewer" class="debug-logs-viewer mono">
+              <div class="log-entry log-info">[SYSTEM] 日志监视器初始化完成。等待发起任务...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Documentation & Limitations -->
+        <div class="tab-content" id="tabDocs">
+          <div class="docs-container markdown-body">
+            <h2>🚀 `antigravity-preview-05-2026` 核心功能与使用指南</h2>
+            <p><strong>Antigravity Agent</strong> 是基于 Gemini API 的全功能托管式 AI Agent。通过单个 API 调用，即可自动获得具备推理、代码执行、文件管理以及网页检索能力的全功能 Agent。</p>
+
+            <h3>一、 已支持的核心功能 (Supported Capabilities)</h3>
+            <ul>
+              <li><strong>代码执行 (Code Execution)</strong>：在云端独立 Linux 沙盒中运行 Bash、Python、Node.js 脚本，支持安装第三方 pip/npm 依赖包。</li>
+              <li><strong>文件系统持久化 (Filesystem)</strong>：支持在 `/workspace` 目录下创建、修改、检索文件。文件在同一个 `environment_id` 内保持持久化状态。</li>
+              <li><strong>网络访问 (Web Access)</strong>：支持通过 Google Search 实时检索公开信息，并使用 URL Context 抓取网页内容。</li>
+              <li><strong>多模态输入 (Multimodal Input)</strong>：支持传入文本与 Base64 格式图片进行视觉与代码联合分析。</li>
+              <li><strong>自定义函数 (Function Calling)</strong>：支持定义客户端 Function，在二轮交互中传递 `function_result`。</li>
+              <li><strong>远程 MCP 服务 (Remote MCP)</strong>：支持注册基于 HTTP 协议的外部 Model Context Protocol 服务器。</li>
+              <li><strong>Token 预算管理 (Budget Control)</strong>：支持设置 `max_total_tokens`，达到限制时返回 `status: incomplete`，可通过 `previous_interaction_id` 无缝恢复。</li>
+              <li><strong>同一沙盒多会话</strong>：可以共享同一个 `environment_id` 中的文件，同时创建多个互不继承对话上下文的独立会话。</li>
+              <li><strong>本地会话持久化</strong>：使用 SQLite 保存会话、交互轮次、Token 用量、执行状态、错误与产物元数据；API Key 不会写入数据库。</li>
+              <li><strong>官方快照文件提取</strong>：支持完整路径或只输入文件名自动定位，目标文件以二进制响应下载，避免 Base64 额外体积。</li>
+            </ul>
+
+            <hr>
+
+            <h3>二、 沙盒与会话的区别</h3>
+            <ul>
+              <li><strong>沙盒环境</strong>由 `environment_id` 标识，保存 `/workspace` 等目录中的文件。</li>
+              <li><strong>对话上下文</strong>通过 `previous_interaction_id` 延续，与沙盒文件系统不是同一概念。</li>
+              <li>点击“<strong>当前沙盒新会话</strong>”会保留沙盒及其文件，但不发送旧的 `previous_interaction_id`；原会话历史仍可单独切换和继续。</li>
+              <li>“<strong>新沙盒</strong>”会同时创建新的远程环境和新的会话，不复用原环境文件。</li>
+            </ul>
+
+            <hr>
+
+            <h3>三、 ⚠️ 预览版功能限制与注意事项 (Limitations & Caveats)</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>限制分类</th>
+                  <th>限制说明与细节</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>生成参数不兼容</strong></td>
+                  <td>不支持 `temperature`、`top_p`、`top_k`、`stop_sequences`、`max_output_tokens`。传入会返回 400 错误。</td>
+                </tr>
+                <tr>
+                  <td><strong>结构化输出</strong></td>
+                  <td>当前 Antigravity Agent 不支持原生的 JSON Schema 结构化输出 (Structured Output)。</td>
+                </tr>
+                <tr>
+                  <td><strong>暂未支持的工具</strong></td>
+                  <td>`file_search`、`computer_use` (电脑屏幕操作)、`google_maps` 暂未在 Agent 中开放。</td>
+                </tr>
+                <tr>
+                  <td><strong>MCP 服务器限制</strong></td>
+                  <td>暂不支持 SSE (Server-Sent Events) 传输模式（仅支持 HTTP 模式）；MCP 服务器 `name` 必须严格为纯小写字母与数字。</td>
+                </tr>
+                <tr>
+                  <td><strong>环境文件下载</strong></td>
+                  <td>Gemini Files API 返回的是完整 TAR 快照，因此首次提取速度取决于整个环境大小，而不只是目标文件大小。本 WebUI 会缓存快照 60 秒，连续提取多个文件时可复用缓存；Agent 成功修改环境后缓存会自动失效，也可勾选“强制刷新环境快照”。</td>
+                </tr>
+                <tr>
+                  <td><strong>文件提取安全限制</strong></td>
+                  <td>单个目标文件默认最大 50 MB，单次快照最多处理 512 MB；路径不能包含 `..` 或空字节。同名文件不唯一时必须选择完整路径。</td>
+                </tr>
+                <tr>
+                  <td><strong>环境有效期</strong></td>
+                  <td>远程环境由 Google 托管并可能在长时间不活跃后被清理。SQLite 只保存本地会话历史和元数据，不会复制或永久保留整个远程文件系统。</td>
+                </tr>
+                <tr>
+                  <td><strong>多模态类型限制</strong></td>
+                  <td>目前仅支持文本和图片 (Image) 输入，音频 (Audio)、视频 (Video) 和 PDF 直接上传暂未开放。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- API Key Modal -->
+  <div class="modal-overlay" id="apiKeyModal" style="display: none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3><span class="material-symbols-outlined">key</span> 配置 Gemini API Key</h3>
+        <button class="btn-icon" id="closeApiKeyModalBtn"><span class="material-symbols-outlined">close</span></button>
+      </div>
+      <div class="modal-body">
+        <p>请输入您的 Google Gemini API Key（支持免费层与付费层项目）：</p>
+        <div class="form-group">
+          <input type="password" id="modalApiKeyInput" placeholder="AIzaSy..." class="form-control mono">
+        </div>
+        <small class="form-hint">密钥仅保存在当前浏览器的 localStorage 中，通过您自己的 node.js 本地服务发起请求，绝不向第三方泄漏。</small>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelApiKeyBtn">取消</button>
+        <button class="btn btn-primary" id="saveApiKeyBtn">保存 Key</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Detailed Error Details Modal -->
+  <div class="modal-overlay" id="errorModal" style="display: none;">
+    <div class="modal modal-lg">
+      <div class="modal-header" style="border-bottom-color: var(--accent-danger);">
+        <h3 style="color: var(--accent-danger);">
+          <span class="material-symbols-outlined">error</span> 接口请求异常详细日志 (API Error Inspector)
+        </h3>
+        <button class="btn-icon" id="closeErrorModalBtn"><span class="material-symbols-outlined">close</span></button>
+      </div>
+      <div class="modal-body scrollable" style="max-height: 70vh;">
+        <div class="form-group">
+          <label>错误摘要 (Error Overview)：</label>
+          <div id="errorModalOverview" class="error-box mono"></div>
+        </div>
+
+        <div class="form-group">
+          <label>发送给 Gemini API 的请求 Payload (Request Body)：</label>
+          <pre id="errorModalRequest" class="code-box mono"></pre>
+        </div>
+
+        <div class="form-group">
+          <label>Google Gemini API 返回的原生响应 JSON (Raw Error Object)：</label>
+          <pre id="errorModalRaw" class="code-box mono"></pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="switchLogsTabBtn">前往“调试与错误日志”Tab</button>
+        <button class="btn btn-primary" id="dismissErrorModalBtn">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/app.js?v=1.4.0"></script>
+</body>
+</html>
