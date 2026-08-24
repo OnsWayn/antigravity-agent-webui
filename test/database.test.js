@@ -59,6 +59,33 @@ test('imports legacy localStorage sessions without duplicating turns', () => {
   });
 });
 
+test('stores encrypted-looking upstream keys and hashed client tokens', () => {
+  withDatabase((database) => {
+    database.insertUpstreamKey({
+      name: 'prod',
+      ciphertext: 'cipher',
+      iv: 'iv',
+      tag: 'tag',
+      suffix: 'Ab12'
+    });
+    const keys = database.listUpstreamKeys();
+    assert.equal(keys.length, 1);
+    assert.equal(keys[0].key_suffix, 'Ab12');
+    assert.equal(JSON.stringify(keys).includes('AIza'), false);
+
+    const token = database.insertClientToken({
+      name: 'ui',
+      tokenHash: 'abc',
+      tokenPrefix: 'ag-123456',
+      quotaTokens: 100
+    });
+    database.addClientTokenUsage(token.id, 12);
+    const loaded = database.getClientToken(token.id);
+    assert.equal(loaded.used_tokens, 12);
+    assert.equal(loaded.quota_tokens, 100);
+  });
+});
+
 test('deleting a session cascades to its turns', () => {
   withDatabase((database) => {
     const saved = database.saveInteraction({

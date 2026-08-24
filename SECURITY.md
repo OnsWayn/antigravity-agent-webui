@@ -12,7 +12,8 @@ If you intentionally use a separate frontend origin, list it explicitly in `ALLO
 
 ## Sensitive local data
 
-- The Gemini API key is stored in the browser's `localStorage`; it is sent through the local server to Google but is not written to SQLite.
+- The WebUI Gemini API key is stored in the browser's `localStorage`; it is sent through the local server to Google but is not written to SQLite.
+- If the protocol gateway is enabled, upstream Gemini keys are encrypted in SQLite with `GATEWAY_MASTER_KEY`. Treat `data/antigravity.db` and `.env` as equivalent to possessing that Google key. Downstream `ag-` tokens can spend quota; revoke them if leaked.
 - SQLite stores prompts, model outputs, execution steps, usage, artifact paths and error summaries. Treat `data/antigravity.db` as private.
 - Environment snapshot TAR files may contain remote sandbox data. They are stored temporarily under `data/snapshot-cache/` and are ignored by Git.
 - Do not commit `.env`, database files, snapshot caches, logs or exported artifacts that contain private information.

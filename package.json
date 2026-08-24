@@ -1,7 +1,7 @@
 {
   "name": "antigravity-agent-webui",
-  "version": "1.4.0",
-  "description": "Local Web UI for Gemini Antigravity managed agents, persistent sessions and sandbox file extraction",
+  "version": "1.5.2",
+  "description": "Local Web UI and OpenAI/Gemini protocol gateway for Gemini Antigravity managed agents",
   "author": "OnsWayn",
   "license": "Apache-2.0",
   "keywords": [
@@ -15,18 +15,28 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
+    "dev": "concurrently -k -n api,web -c cyan,magenta \"node server.js\" \"vite\"",
+    "build": "vite build",
     "test": "node --test",
-    "check": "node --check server.js && node --check database.js && node --check environment-files.js && node --check http-security.js && node --check snapshot-cache.js && node --check public/js/app.js",
-    "verify": "npm run check && npm test"
+    "check": "node --check server.js && node --check database.js && node --check environment-files.js && node --check http-security.js && node --check snapshot-cache.js && node --check gateway/models.js && node --check gateway/crypto.js && node --check gateway/translate.js && node --check gateway/stream.js && node --check gateway/interactions.js && node --check gateway/auth.js && node --check gateway/errors.js && node --check gateway/upstream.js && node --check gateway/routes.js && node --check gateway/admin-routes.js",
+    "verify": "npm run check && npm test && npm run build"
   },
   "engines": {
     "node": ">=22.5.0"
   },
   "dependencies": {
+    "dompurify": "^3.4.14",
     "express": "^4.19.2",
     "https-proxy-agent": "^7.0.4",
+    "marked": "^18.0.10",
     "node-fetch": "^2.7.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "tar-stream": "^3.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.0",
+    "concurrently": "^10.0.5",
+    "vite": "^8.2.2"
   }
 }

@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.5.2] - 2026-08-24
+
+### Added
+
+- Upstream key round-robin with per-conversation key affinity.
+- After 3 consecutive 429s on one key, fail over to another key, flatten the current chat, and open a new sandbox instead of dropping context.
+
+## [1.5.1] - 2026-08-24
+
+### Changed
+
+- Gateway `/v1/models` now lists only `antigravity-preview-05-2026` and `antigravity-preview-05-2026/<backend>`, not the API key's Gemini catalog.
+- WebUI rewritten in React (Vite). The model picker is Antigravity `agent_config.model` only.
+- Gemini native paths accept slashes in the model id (`.../antigravity-preview-05-2026/gemini-3.7-flash:generateContent`).
+
+## [1.5.0] - 2026-08-24
+
+### Added
+
+- Optional protocol gateway exposing `/v1/chat/completions`, `/v1/responses` (`/v1/chat/responses` alias), and Gemini `generateContent` / `streamGenerateContent` shapes.
+- Server-side upstream Gemini keys (AES-256-GCM) and downstream `ag-` tokens with quota tracking.
+- Conversation delta handling via `previous_interaction_id`, image parts, OpenAI tools, and remote MCP URLs.
+- WebUI「协议中转站」panel for keys, tokens, usage, and example curl commands.
+
+### Security
+
+- Gateway routes authenticate with downstream tokens instead of browser origin checks.
+- Real Gemini keys are never accepted from gateway clients and are not returned by the admin API.
+
 ## [1.4.0] - 2026-07-27
 
 ### Added

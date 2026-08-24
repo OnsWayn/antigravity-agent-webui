@@ -245,7 +245,11 @@ class AppDatabase {
 
     if (!this.tableExists('sessions')) {
       this.createSchemaV2();
+      this.createSchemaV3();
+      this.createSchemaV4();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
       return;
     }
 
@@ -255,6 +259,104 @@ class AppDatabase {
       this.migrateV1ToV2();
     }
     this.createSchemaV2();
+    this.createSchemaV3();
+    if (version < 3) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
+    }
+    this.createSchemaV4();
+    if (version < 4) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
+    }
+  }
+
+  columnExists(table, name) {
+    if (!this.tableExists(table)) return false;
+    return this.db.prepare(`PRAGMA table_info(${table})`).all().some((column) => column.name === name);
+  }
+
+  ensureColumn(table, name, spec) {
+    if (this.columnExists(table, name)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${spec}`);
+  }
+
+  createSchemaV4() {
+    if (!this.tableExists('upstream_keys') || !this.tableExists('gateway_conversations')) return;
+    this.ensureColumn('upstream_keys', 'cooldown_until', 'INTEGER');
+    this.ensureColumn('gateway_conversations', 'upstream_key_id', 'TEXT');
+    this.ensureColumn('gateway_conversations', 'transcript_json', 'TEXT');
+  }
+
+  createSchemaV3() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS upstream_keys (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        key_ciphertext TEXT NOT NULL,
+        key_iv TEXT NOT NULL,
+        key_tag TEXT NOT NULL,
+        key_suffix TEXT NOT NULL,
+        proxy_url TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_used_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS client_tokens (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_prefix TEXT NOT NULL,
+        quota_tokens INTEGER NOT NULL DEFAULT -1,
+        used_tokens INTEGER NOT NULL DEFAULT 0,
+        rpm INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_client_tokens_hash ON client_tokens(token_hash);
+
+      CREATE TABLE IF NOT EXISTS usage_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_id TEXT,
+        endpoint TEXT,
+        model TEXT,
+        interaction_id TEXT,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        status INTEGER,
+        duration_ms INTEGER,
+        error TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_usage_logs_token_created
+        ON usage_logs(token_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS gateway_conversations (
+        token_id TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        interaction_id TEXT,
+        environment_id TEXT,
+        prefix_hash TEXT,
+        model TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (token_id, conversation_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS gateway_tool_calls (
+        openai_call_id TEXT PRIMARY KEY,
+        google_call_id TEXT NOT NULL,
+        name TEXT,
+        token_id TEXT,
+        interaction_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+    `);
   }
 
   prepareStatements() {
@@ -529,6 +631,255 @@ class AppDatabase {
       artifacts: Number(this.db.prepare('SELECT COUNT(*) AS count FROM artifacts').get().count),
       errors: Number(this.db.prepare('SELECT COUNT(*) AS count FROM task_errors').get().count)
     };
+  }
+
+  insertUpstreamKey({ id, name, ciphertext, iv, tag, suffix, proxyUrl }) {
+    const now = Date.now();
+    const keyId = id || `uk-${crypto.randomUUID()}`;
+    this.db.prepare(`
+      INSERT INTO upstream_keys (
+        id, name, key_ciphertext, key_iv, key_tag, key_suffix, proxy_url,
+        enabled, fail_count, last_used_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?, ?)
+    `).run(keyId, name || 'Gemini Key', ciphertext, iv, tag, suffix || '', proxyUrl || null, now, now);
+    return this.getUpstreamKey(keyId);
+  }
+
+  getUpstreamKey(id) {
+    return this.db.prepare('SELECT * FROM upstream_keys WHERE id = ?').get(id) || null;
+  }
+
+  listUpstreamKeys() {
+    return this.db.prepare('SELECT * FROM upstream_keys ORDER BY created_at DESC').all();
+  }
+
+  listEnabledUpstreamKeys() {
+    return this.db.prepare('SELECT * FROM upstream_keys WHERE enabled = 1 ORDER BY last_used_at ASC, created_at ASC').all();
+  }
+
+  updateUpstreamKey(id, fields = {}) {
+    const existing = this.getUpstreamKey(id);
+    if (!existing) return null;
+    const now = Date.now();
+    this.db.prepare(`
+      UPDATE upstream_keys SET
+        name = ?,
+        key_ciphertext = ?,
+        key_iv = ?,
+        key_tag = ?,
+        key_suffix = ?,
+        proxy_url = ?,
+        enabled = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      fields.name !== undefined ? fields.name : existing.name,
+      fields.ciphertext !== undefined ? fields.ciphertext : existing.key_ciphertext,
+      fields.iv !== undefined ? fields.iv : existing.key_iv,
+      fields.tag !== undefined ? fields.tag : existing.key_tag,
+      fields.suffix !== undefined ? fields.suffix : existing.key_suffix,
+      fields.proxyUrl !== undefined ? fields.proxyUrl : existing.proxy_url,
+      fields.enabled !== undefined ? (fields.enabled ? 1 : 0) : existing.enabled,
+      now,
+      id
+    );
+    return this.getUpstreamKey(id);
+  }
+
+  deleteUpstreamKey(id) {
+    return this.db.prepare('DELETE FROM upstream_keys WHERE id = ?').run(id).changes > 0;
+  }
+
+  markUpstreamKeyUsed(id, { failed = false, rateLimited = false, cooldownMs = 60000 } = {}) {
+    const now = Date.now();
+    if (rateLimited) {
+      this.db.prepare(`
+        UPDATE upstream_keys SET
+          fail_count = fail_count + 1,
+          cooldown_until = CASE WHEN fail_count + 1 >= 3 THEN ? ELSE cooldown_until END,
+          updated_at = ?
+        WHERE id = ?
+      `).run(now + Number(cooldownMs || 60000), now, id);
+      return;
+    }
+    if (failed) {
+      this.db.prepare(`
+        UPDATE upstream_keys SET fail_count = fail_count + 1, updated_at = ? WHERE id = ?
+      `).run(now, id);
+      return;
+    }
+    this.db.prepare(`
+      UPDATE upstream_keys SET fail_count = 0, cooldown_until = NULL, last_used_at = ?, updated_at = ? WHERE id = ?
+    `).run(now, now, id);
+  }
+
+  insertClientToken({ id, name, tokenHash, tokenPrefix, quotaTokens, rpm, expiresAt }) {
+    const now = Date.now();
+    const tokenId = id || `tk-${crypto.randomUUID()}`;
+    this.db.prepare(`
+      INSERT INTO client_tokens (
+        id, name, token_hash, token_prefix, quota_tokens, used_tokens,
+        rpm, enabled, expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?)
+    `).run(
+      tokenId,
+      name || 'API Token',
+      tokenHash,
+      tokenPrefix,
+      Number.isFinite(quotaTokens) ? quotaTokens : -1,
+      Number.isFinite(rpm) ? rpm : null,
+      expiresAt || null,
+      now,
+      now
+    );
+    return this.getClientToken(tokenId);
+  }
+
+  getClientToken(id) {
+    return this.db.prepare('SELECT * FROM client_tokens WHERE id = ?').get(id) || null;
+  }
+
+  getClientTokenByHash(tokenHash) {
+    return this.db.prepare('SELECT * FROM client_tokens WHERE token_hash = ?').get(tokenHash) || null;
+  }
+
+  listClientTokens() {
+    return this.db.prepare('SELECT * FROM client_tokens ORDER BY created_at DESC').all();
+  }
+
+  updateClientToken(id, fields = {}) {
+    const existing = this.getClientToken(id);
+    if (!existing) return null;
+    const now = Date.now();
+    this.db.prepare(`
+      UPDATE client_tokens SET
+        name = ?,
+        quota_tokens = ?,
+        rpm = ?,
+        enabled = ?,
+        expires_at = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      fields.name !== undefined ? fields.name : existing.name,
+      fields.quotaTokens !== undefined ? fields.quotaTokens : existing.quota_tokens,
+      fields.rpm !== undefined ? fields.rpm : existing.rpm,
+      fields.enabled !== undefined ? (fields.enabled ? 1 : 0) : existing.enabled,
+      fields.expiresAt !== undefined ? fields.expiresAt : existing.expires_at,
+      now,
+      id
+    );
+    return this.getClientToken(id);
+  }
+
+  deleteClientToken(id) {
+    return this.db.prepare('DELETE FROM client_tokens WHERE id = ?').run(id).changes > 0;
+  }
+
+  addClientTokenUsage(id, tokens) {
+    const amount = Number(tokens) || 0;
+    if (amount <= 0) return this.getClientToken(id);
+    this.db.prepare(`
+      UPDATE client_tokens SET used_tokens = used_tokens + ?, updated_at = ? WHERE id = ?
+    `).run(amount, Date.now(), id);
+    return this.getClientToken(id);
+  }
+
+  insertUsageLog(entry = {}) {
+    this.db.prepare(`
+      INSERT INTO usage_logs (
+        token_id, endpoint, model, interaction_id, prompt_tokens, completion_tokens,
+        total_tokens, status, duration_ms, error, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.tokenId || null,
+      entry.endpoint || null,
+      entry.model || null,
+      entry.interactionId || null,
+      Number.isFinite(entry.promptTokens) ? entry.promptTokens : null,
+      Number.isFinite(entry.completionTokens) ? entry.completionTokens : null,
+      Number.isFinite(entry.totalTokens) ? entry.totalTokens : null,
+      Number.isFinite(entry.status) ? entry.status : null,
+      Number.isFinite(entry.durationMs) ? entry.durationMs : null,
+      entry.error || null,
+      Date.now()
+    );
+  }
+
+  listUsageLogs({ tokenId, limit = 100 } = {}) {
+    const cap = Math.min(Math.max(Number(limit) || 100, 1), 500);
+    if (tokenId) {
+      return this.db.prepare(`
+        SELECT * FROM usage_logs WHERE token_id = ? ORDER BY created_at DESC LIMIT ?
+      `).all(tokenId, cap);
+    }
+    return this.db.prepare(`
+      SELECT * FROM usage_logs ORDER BY created_at DESC LIMIT ?
+    `).all(cap);
+  }
+
+  getGatewayConversation(tokenId, conversationKey) {
+    if (!tokenId || !conversationKey) return null;
+    return this.db.prepare(`
+      SELECT * FROM gateway_conversations WHERE token_id = ? AND conversation_key = ?
+    `).get(tokenId, conversationKey) || null;
+  }
+
+  upsertGatewayConversation({
+    tokenId,
+    conversationKey,
+    interactionId,
+    environmentId,
+    prefixHash,
+    model,
+    upstreamKeyId,
+    transcript
+  }) {
+    if (!tokenId || !conversationKey) return;
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO gateway_conversations (
+        token_id, conversation_key, interaction_id, environment_id, prefix_hash, model,
+        updated_at, upstream_key_id, transcript_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(token_id, conversation_key) DO UPDATE SET
+        interaction_id = excluded.interaction_id,
+        environment_id = excluded.environment_id,
+        prefix_hash = excluded.prefix_hash,
+        model = COALESCE(excluded.model, gateway_conversations.model),
+        updated_at = excluded.updated_at,
+        upstream_key_id = excluded.upstream_key_id,
+        transcript_json = COALESCE(excluded.transcript_json, gateway_conversations.transcript_json)
+    `).run(
+      tokenId,
+      conversationKey,
+      interactionId || null,
+      environmentId || null,
+      prefixHash || null,
+      model || null,
+      now,
+      upstreamKeyId || null,
+      transcript == null ? null : json(transcript)
+    );
+  }
+
+  saveGatewayToolCall({ openaiCallId, googleCallId, name, tokenId, interactionId }) {
+    if (!openaiCallId || !googleCallId) return;
+    this.db.prepare(`
+      INSERT OR REPLACE INTO gateway_tool_calls (
+        openai_call_id, google_call_id, name, token_id, interaction_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(openaiCallId, googleCallId, name || null, tokenId || null, interactionId || null, Date.now());
+  }
+
+  getGatewayToolCall(openaiCallId) {
+    if (!openaiCallId) return null;
+    return this.db.prepare('SELECT * FROM gateway_tool_calls WHERE openai_call_id = ?').get(openaiCallId) || null;
+  }
+
+  resolveGoogleCallId(openaiCallId) {
+    const row = this.getGatewayToolCall(openaiCallId);
+    return row?.google_call_id || openaiCallId;
   }
 
   close() {

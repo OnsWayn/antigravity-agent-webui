@@ -6,7 +6,7 @@ A local Gemini Interactions API console for Google's hosted `antigravity-preview
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.4.0** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.5.1** · Node.js **22.5+** · License **Apache-2.0**
 
 ## Why this project exists
 
@@ -19,7 +19,7 @@ The API can run a managed agent, but raw interactions do not provide a complete 
 - Filename-only lookup, snapshot caching, forced refresh, and binary file downloads.
 - Legacy Agent Base64 chunking, file.io, and catbox as compatibility fallbacks.
 
-This project is not an OpenAI `/v1/chat/completions` compatible proxy, a remote desktop, or a general-purpose sandbox hosting platform.
+The WebUI remains an Antigravity agent console. Optionally, the same process can expose an OpenAI/Gemini-shaped protocol gateway so other clients can call the managed agent. It is not a remote desktop, and the agent still runs in Google's hosted Linux sandbox rather than on the caller's machine.
 
 ## How it works
 
@@ -61,7 +61,15 @@ Optional: copy `.env.example` to `.env` and adjust the port, database, cache, or
 npm start
 ```
 
-Open <http://localhost:3000> and select **Configure API Key** in the top-right corner. The key is stored only in the current browser's `localStorage` and is never written to SQLite.
+Open <http://localhost:3000> and select **Configure API Key** in the top-right corner.
+
+The WebUI is a React app. For local UI development with hot reload:
+
+```bash
+npm run dev
+```
+
+This starts the API on port 3000 and Vite on port 5173. Production static files are built into `public/` with `npm run build`. The key is stored only in the current browser's `localStorage` and is never written to SQLite.
 
 If the server was already running before a code update, restart Node.js and perform a hard refresh in the browser.
 
@@ -69,7 +77,7 @@ If the server was already running before a code update, restart Node.js and perf
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Bind address. Keep the default to avoid LAN exposure. |
+| `HOST` | `0.0.0.0` | Bind address. `0.0.0.0` accepts LAN connections. Use `127.0.0.1` to stay local-only. |
 | `PORT` | `3000` | Web server port. |
 | `ANTIGRAVITY_DB_PATH` | `data/antigravity.db` | SQLite database path. |
 | `SNAPSHOT_CACHE_DIR` | `data/snapshot-cache` | Environment TAR snapshot cache. |
@@ -78,6 +86,9 @@ If the server was already running before a code update, restart Node.js and perf
 | `HTTP_PROXY` | empty | HTTP proxy fallback when `HTTPS_PROXY` is unset. |
 | `PROXY_URL` | empty | Additional compatible proxy variable. |
 | `ALLOWED_ORIGINS` | local origins | Extra browser origins, separated by commas. |
+| `GATEWAY_ENABLED` | `true` | Set `false` to disable `/v1` and `/v1beta` protocol routes. |
+| `GATEWAY_MASTER_KEY` | empty | Required to encrypt upstream Gemini keys and enable the gateway. |
+| `GATEWAY_ADMIN_TOKEN` | empty | Bearer token for the gateway admin API and WebUI panel. |
 
 A proxy can also be configured in the WebUI. Explicitly disabling it in the UI prevents the server from using proxy environment variables for that request.
 
@@ -128,6 +139,10 @@ By default, browser requests are accepted only from the matching local WebUI ori
 | `POST` | `/api/interactions/create` | Create or continue an Agent interaction. |
 | `POST` | `/api/interactions/fetch-file` | Extract a file through snapshots or a fallback provider. |
 | `GET` | `/api/logs` | In-memory logs for the current server process. |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions gateway (Antigravity sandbox). |
+| `POST` | `/v1/responses` | OpenAI Responses gateway. `/v1/chat/responses` is an alias. |
+| `POST` | `/v1beta/models/{model}:generateContent` | Gemini-shaped request; still forwarded to Interactions. |
+| `GET` | `/v1/models` | Gateway model list (`antigravity-preview-05-2026` and four backend models). |
 
 Interaction requests can also include:
 
@@ -143,6 +158,33 @@ curl.exe http://localhost:3000/api/interactions/create `
   --data-raw '{"agent":"antigravity-preview-05-2026","input":"Create /workspace/hello.txt","environment":"remote"}'
 ```
 
+## Protocol gateway
+
+Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open the **协议中转站** tab. Add an upstream Gemini key (stored encrypted) and create a downstream `ag-` token. Other apps should send that token, never the Gemini key.
+
+The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. Allowed `agent_config.model` values are `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and `gemini-3.5-flash-lite`.
+
+Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s a key cools down for 60 seconds, and the gateway migrates the full chat transcript onto another key with a **new** sandbox instead of dropping the conversation. Files from the old sandbox are not transferred.
+
+> **Note:** The model list above is hardcoded in `gateway/models.js` and `web/src/lib.js`. Google does not currently provide an API to query which `agent_config.model` values a managed agent supports — the standard `/v1beta/models` endpoint only returns standalone Gemini models, not agent-internal engine options. If Google adds or removes supported models in the future, these two files must be updated manually.
+
+Conversation state uses `previous_interaction_id`. Client-replayed `messages[]` are treated as a delta, not resent in full. Images (`image_url` / `inline_data`) are forwarded. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
+
+The gateway does **not** expose the Gemini model catalog on the API key. It only serves the Antigravity agent and the four `agent_config.model` backends that agent accepts:
+
+- `antigravity-preview-05-2026` (default backend `gemini-3.7-flash`)
+- `antigravity-preview-05-2026/gemini-3.7-flash`
+- `antigravity-preview-05-2026/gemini-3.6-flash`
+- `antigravity-preview-05-2026/gemini-3.5-flash`
+- `antigravity-preview-05-2026/gemini-3.5-flash-lite`
+
+```powershell
+curl.exe http://localhost:3000/v1/chat/completions `
+  -H "Authorization: Bearer ag-YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"model":"antigravity-preview-05-2026/gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
+```
+
 ## Data and privacy
 
 SQLite is stored at `data/antigravity.db` by default. It contains prompts, model output, execution steps, token usage, error summaries, and artifact paths. API keys are not stored, but the database content itself may be sensitive and must not be committed to a public repository.
@@ -154,12 +196,14 @@ See [SECURITY.md](SECURITY.md) for the complete security policy.
 ## Project structure
 
 ```text
-server.js             Express API, Gemini requests, and file routes
+server.js             Express API, Gemini requests, file routes, and gateway mount
+gateway/              OpenAI / Gemini protocol adapters, token auth, and admin API
 database.js           SQLite schema, migrations, and session persistence
 environment-files.js  TAR path normalization and safe extraction
 snapshot-cache.js     Snapshot cache and concurrent-download deduplication
 http-security.js      Local-origin restrictions and CORS response headers
-public/               WebUI, styles, and browser-side application logic
+web/                  React WebUI source (Vite)
+public/               Built WebUI served by Express
 test/                 SQLite, TAR, cache, and security tests
 data/                 Runtime database and cache files (not committed)
 ```

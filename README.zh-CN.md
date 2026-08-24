@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.4.0** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.5.1** · Node.js **22.5+** · License **Apache-2.0**
 
 ## 这个项目解决什么问题
 
@@ -19,7 +19,7 @@
 - 支持只输入文件名自动定位文件、快照缓存、强制刷新和二进制下载。
 - 保留 Agent Base64 分块、file.io 和 catbox 作为兼容性备用通道。
 
-本项目不是 OpenAI `/v1/chat/completions` 兼容中转站，也不是远程桌面或通用沙盒托管平台。
+WebUI 仍然是 Antigravity Agent 控制台。同一进程可以额外开启 OpenAI / Gemini 外形的协议网关，给其他客户端调用这个托管 Agent。它不是远程桌面；Agent 仍然跑在 Google 托管的 Linux 沙盒里，而不是调用方本机。
 
 ## 工作方式
 
@@ -61,7 +61,15 @@ npm install
 npm start
 ```
 
-浏览器访问 <http://localhost:3000>，点击右上角“配置 API Key”。API Key 只保存在当前浏览器的 `localStorage`，不会写入 SQLite。
+浏览器访问 <http://localhost:3000>，点击右上角“配置 API Key”。
+
+WebUI 使用 React。本地热更新开发：
+
+```bash
+npm run dev
+```
+
+会同时启动 3000 端口的 API 和 5173 端口的 Vite。生产静态文件由 `npm run build` 输出到 `public/`。API Key 只保存在当前浏览器的 `localStorage`，不会写入 SQLite。
 
 如果服务之前已经运行，修改代码后需要重启 Node.js 服务，再对页面执行一次强制刷新。
 
@@ -69,7 +77,7 @@ npm start
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | 监听地址。保持默认值可避免局域网暴露。 |
+| `HOST` | `0.0.0.0` | 监听地址。`0.0.0.0` 允许局域网访问；只想本机访问时改回 `127.0.0.1`。 |
 | `PORT` | `3000` | Web 服务端口。 |
 | `ANTIGRAVITY_DB_PATH` | `data/antigravity.db` | SQLite 数据库路径。 |
 | `SNAPSHOT_CACHE_DIR` | `data/snapshot-cache` | 环境 TAR 快照缓存目录。 |
@@ -78,6 +86,9 @@ npm start
 | `HTTP_PROXY` | 空 | 未设置 `HTTPS_PROXY` 时使用的 HTTP 代理。 |
 | `PROXY_URL` | 空 | 兼容的备用代理变量。 |
 | `ALLOWED_ORIGINS` | 本机来源 | 额外允许的浏览器来源，多个来源用逗号分隔。 |
+| `GATEWAY_ENABLED` | `true` | 设为 `false` 时关闭 `/v1` 和 `/v1beta` 协议路由。 |
+| `GATEWAY_MASTER_KEY` | 空 | 加密上游 Gemini Key 并启用中转站，必填。 |
+| `GATEWAY_ADMIN_TOKEN` | 空 | 中转站管理 API / WebUI 面板的 Bearer Token。 |
 
 WebUI 左侧也可以配置代理。界面中明确关闭代理后，服务端不会使用环境变量中的代理。
 
@@ -127,6 +138,10 @@ test -s /workspace/diagram.svg && ls -l /workspace/diagram.svg，确认文件存
 | `POST` | `/api/interactions/create` | 创建或继续 Agent 任务。 |
 | `POST` | `/api/interactions/fetch-file` | 从环境快照或备用通道提取文件。 |
 | `GET` | `/api/logs` | 当前服务进程的内存日志。 |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions 网关（Antigravity 沙盒）。 |
+| `POST` | `/v1/responses` | OpenAI Responses 网关；`/v1/chat/responses` 为别名。 |
+| `POST` | `/v1beta/models/{model}:generateContent` | Gemini 请求外形，内部仍转发到 Interactions。 |
+| `GET` | `/v1/models` | 网关模型列表（agent 以及 4 个底层型号）。 |
 
 创建任务时可以提交：
 
@@ -142,6 +157,33 @@ curl.exe http://localhost:3000/api/interactions/create `
   --data-raw '{"agent":"antigravity-preview-05-2026","input":"在 /workspace 生成 hello.txt","environment":"remote"}'
 ```
 
+## 协议中转站
+
+在 `.env` 中设置 `GATEWAY_MASTER_KEY` 和 `GATEWAY_ADMIN_TOKEN`，重启后打开「协议中转站」面板。添加加密保存的上游 Gemini Key，再创建下游 `ag-` Token。其他应用只应使用该 Token，不要再传 Gemini Key。
+
+网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。允许的 `agent_config.model`：`gemini-3.7-flash`、`gemini-3.6-flash`、`gemini-3.5-flash`、`gemini-3.5-flash-lite`。
+
+可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 后冷却 60 秒，并把当前对话全文带到下一把 Key 上开**新沙盒**继续，不会丢上下文（旧沙盒里的文件带不过去）。
+
+> **注意**：上述模型列表是在代码中硬编码的（`gateway/models.js` 和 `web/src/lib.js`）。Google 目前没有提供 API 来查询某个 managed agent 支持哪些 `agent_config.model` 值——标准的 `/v1beta/models` 接口只返回独立 Gemini 模型目录，不包含 Agent 内部引擎信息。如果 Google 将来新增或下线模型，需要手动更新这两个文件。
+
+多轮对话使用服务端 `previous_interaction_id`。前端回传的完整 `messages[]` 只用来计算本轮增量，不会整段再发一遍。支持图片。OpenAI `tools` 会变成自定义函数并由客户端执行；远程 MCP URL 可通过 `extra_body.mcp_servers` 传递。本机 stdio MCP 无法在 Google 沙盒里运行。
+
+网关**不会**列出该 API Key 名下的普通 Gemini 模型目录。它只提供 Antigravity Agent，以及这个 Agent 允许的 4 个 `agent_config.model`：
+
+- `antigravity-preview-05-2026`（默认底层 `gemini-3.7-flash`）
+- `antigravity-preview-05-2026/gemini-3.7-flash`
+- `antigravity-preview-05-2026/gemini-3.6-flash`
+- `antigravity-preview-05-2026/gemini-3.5-flash`
+- `antigravity-preview-05-2026/gemini-3.5-flash-lite`
+
+```powershell
+curl.exe http://localhost:3000/v1/chat/completions `
+  -H "Authorization: Bearer ag-YOUR_TOKEN" `
+  -H "Content-Type: application/json" `
+  --data-raw '{"model":"antigravity-preview-05-2026/gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
+```
+
 ## 数据与隐私
 
 SQLite 默认位于 `data/antigravity.db`，会保存 Prompt、模型输出、执行步骤、Token 用量、错误摘要和产物路径。它不会保存 API Key，但这些内容本身可能敏感，请勿提交到公共仓库。
@@ -153,12 +195,14 @@ SQLite 默认位于 `data/antigravity.db`，会保存 Prompt、模型输出、�
 ## 项目结构
 
 ```text
-server.js             Express API、Gemini 调用和文件提取路由
+server.js             Express API、Gemini 调用、文件提取和网关挂载
+gateway/              OpenAI / Gemini 协议适配、Token 鉴额和管理 API
 database.js           SQLite schema、迁移和会话持久化
 environment-files.js  TAR 路径规范化与安全提取
 snapshot-cache.js     环境快照缓存和并发下载合并
 http-security.js      本地来源限制与 CORS 响应头
-public/               WebUI、样式和前端交互逻辑
+web/                  React WebUI 源码（Vite）
+public/               Express 提供的构建产物
 test/                 SQLite、TAR、缓存和安全测试
 data/                 运行时数据库与缓存（不提交）
 ```

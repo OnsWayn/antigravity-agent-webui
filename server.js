@@ -7,6 +7,8 @@ const { AppDatabase } = require('./database');
 const { extractFileFromTar } = require('./environment-files');
 const { createOriginGuard } = require('./http-security');
 const { SnapshotCache } = require('./snapshot-cache');
+const { createGatewayRouter } = require('./gateway/routes');
+const { createAdminRouter } = require('./gateway/admin-routes');
 
 try {
   process.loadEnvFile(path.join(__dirname, '.env'));
@@ -16,7 +18,7 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 const DATABASE_PATH = process.env.ANTIGRAVITY_DB_PATH || path.join(__dirname, 'data', 'antigravity.db');
 const database = new AppDatabase(DATABASE_PATH);
 const snapshotCache = new SnapshotCache({
@@ -29,6 +31,22 @@ app.use(createOriginGuard({
   allowedOrigins: process.env.ALLOWED_ORIGINS || ''
 }));
 app.use(express.json({ limit: '50mb' }));
+
+const GATEWAY_MASTER_KEY = process.env.GATEWAY_MASTER_KEY || '';
+const GATEWAY_ADMIN_TOKEN = process.env.GATEWAY_ADMIN_TOKEN || '';
+const GATEWAY_ENABLED = process.env.GATEWAY_ENABLED !== 'false';
+app.use(createGatewayRouter({
+  database,
+  masterKey: GATEWAY_MASTER_KEY,
+  enabled: GATEWAY_ENABLED,
+  log: logMessage
+}));
+app.use('/api/gateway', createAdminRouter({
+  database,
+  masterKey: GATEWAY_MASTER_KEY,
+  adminToken: GATEWAY_ADMIN_TOKEN,
+  enabled: GATEWAY_ENABLED
+}));
 app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,
   maxAge: 0,
@@ -373,7 +391,7 @@ app.post('/api/interactions/create', async (req, res) => {
     input,
     environment = 'remote',
     sources,
-    model = 'gemini-3.6-flash',
+    model = 'gemini-3.7-flash',
     maxTotalTokens,
     tools,
     previousInteractionId,
@@ -745,7 +763,9 @@ const server = app.listen(PORT, HOST, () => {
   const displayHost = HOST === '0.0.0.0' || HOST === '::' ? 'localhost' : HOST;
   logMessage('info', `Antigravity Agent Web UI Server started on http://${displayHost}:${PORT}`, {
     host: HOST,
-    database: DATABASE_PATH
+    database: DATABASE_PATH,
+    gatewayEnabled: GATEWAY_ENABLED,
+    gatewayConfigured: Boolean(GATEWAY_MASTER_KEY)
   });
 }).on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
