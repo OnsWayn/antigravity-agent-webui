@@ -1,8 +1,8 @@
-# Antigravity Agent Web UI
+# Antigravity Studio
 
 English | [简体中文](README.zh-CN.md)
 
-A local Gemini Interactions API console for Google's hosted `antigravity-preview-05-2026` managed agent. Create or reuse remote Linux environments, inspect execution traces, persist local conversations, and safely extract files from the sandbox.
+A high-performance **OpenAI / Gemini protocol gateway** and **management dashboard** for Google's hosted `antigravity-preview-05-2026` managed agents. Bridge remote Linux sandboxes into standard OpenAI-compatible API endpoints with multi-key pooling, TPM awareness, failover migration, strict session isolation, fine-grained token control, and full-link logging.
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 

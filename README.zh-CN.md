@@ -1,8 +1,8 @@
-# Antigravity Agent Web UI
+# Antigravity Studio
 
 [English](README.md) | 简体中文
 
-一个本地运行的 Gemini Interactions API Web 控制台，面向 Google 托管的 `antigravity-preview-05-2026` managed agent。它可以创建或复用远程 Linux 沙盒，查看执行轨迹，保存本地会话，并安全提取沙盒中的文件。
+面向 Google Gemini `antigravity-preview-05-2026` 托管智能体的 **OpenAI / Gemini 协议中转网关** 与 **运维管理控制台**。它将 Google 云端远程 Linux 沙盒桥接为标准 OpenAI / Gemini 接口，支持多 Key 轮换池、TPM 避让、故障平滑迁移、会话隔离、细粒度 Token 控制与全链路日志审计。
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 

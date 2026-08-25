@@ -1,7 +1,7 @@
 {
   "name": "antigravity-agent-webui",
   "version": "1.7.0",
-  "description": "Local Web UI and OpenAI/Gemini protocol gateway for Gemini Antigravity managed agents",
+  "description": "High-performance OpenAI/Gemini protocol gateway and management dashboard for Gemini Antigravity managed agents",
   "author": "OnsWayn",
   "license": "Apache-2.0",
   "keywords": [
@@ -9,7 +9,10 @@
     "antigravity",
     "managed-agent",
     "interactions-api",
-    "webui",
+    "openai-api",
+    "protocol-gateway",
+    "api-gateway",
+    "dashboard",
     "sandbox"
   ],
   "main": "server.js",
