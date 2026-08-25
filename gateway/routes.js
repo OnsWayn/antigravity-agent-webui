@@ -3,7 +3,7 @@ const { authenticateClient } = require('./auth');
 const { openaiError, geminiError, sendJson } = require('./errors');
 const { callInteractions } = require('./interactions');
 const { AGENT_ID, listGatewayModels, resolveModel } = require('./models');
-const { isRateLimitError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS } = require('./upstream');
+const { isRateLimitError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker } = require('./upstream');
 const {
   applyStreamEvent,
   emitChatCompletionsFinish,
@@ -13,11 +13,14 @@ const {
   writeSse,
   chatChunk
 } = require('./stream');
+const { createGatewayLogger, generateRequestId } = require('./logger');
+const { createSessionLockManager } = require('./lock');
 const {
   buildGeminiConversation,
   buildOpenAIConversation,
   buildResponsesConversation,
   conversationKeyFrom,
+  requireConversationKey,
   geminiToolsFromBody,
   mergeTools,
   migrateConversationForKeyChange,
@@ -28,6 +31,39 @@ const {
   toResponsesResult,
   usageFromInteraction
 } = require('./translate');
+
+function sanitizeHeaders(headers = {}) {
+  const safe = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (/auth|key|secret|cookie|token/i.test(key)) {
+      safe[key] = '[REDACTED]';
+    } else {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
+
+function sanitizeForStorage(value, key = '') {
+  if (value === null || value === undefined) return value;
+  if (/api.?key|authorization|secret|password/i.test(key)) return '[REDACTED]';
+  if (typeof value === 'string') {
+    if (value.startsWith('data:') && value.includes(';base64,')) {
+      return `[base64 image omitted: ${value.length} chars]`;
+    }
+    if (key === 'data' && value.length > 256) return `[binary data omitted: ${value.length} chars]`;
+    if (value.length > 50000) return `${value.slice(0, 50000)}\n[truncated]`;
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeForStorage(item));
+  if (typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [
+      childKey,
+      sanitizeForStorage(childValue, childKey)
+    ]));
+  }
+  return value;
+}
 
 function publicUpstreamKey(row) {
   return {
@@ -142,9 +178,20 @@ function createGatewayRouter(options = {}) {
     database,
     masterKey,
     enabled = process.env.GATEWAY_ENABLED !== 'false',
+    enforceSessionHeader = process.env.GATEWAY_ENFORCE_SESSION_HEADER === 'true',
+    sessionLockTimeoutMs = 120000,
+    sessionQueueLimit = 3,
     log = () => {},
     callUpstream = callInteractions
   } = options;
+
+  const logger = createGatewayLogger(log);
+  const tpmTracker = new TpmTracker();
+  const lockManager = createSessionLockManager({
+    defaultTimeoutMs: sessionLockTimeoutMs,
+    defaultQueueLimit: sessionQueueLimit,
+    onLockEvent: (level, event, data) => logger.logEvent(level, event, data)
+  });
 
   const router = express.Router();
 
@@ -171,13 +218,16 @@ function createGatewayRouter(options = {}) {
     else sendJson(res, status, openaiError(status, error.message, error.code || 'upstream_error', 'api_error').body);
   }
 
-  function bindConversationToKey(conversation, upstream, source, { forceMigrate = false } = {}) {
+  function bindConversationToKey(conversation, upstream, source, { forceMigrate = false, requestId } = {}) {
     const boundId = conversation.upstreamKeyId || source?.stored?.upstream_key_id;
     if (!forceMigrate && boundId && boundId === upstream.row.id) return conversation;
     if (!forceMigrate && !boundId) return conversation;
-    log('info', 'Migrating conversation onto a new upstream key and sandbox', {
-      from: boundId || null,
-      to: upstream.row.id
+    logger.logEvent('info', 'context_migration_started', {
+      requestId,
+      conversationKey: conversation.conversationKey,
+      fromKeyUpstreamId: boundId || null,
+      toKeyUpstreamId: upstream.row.id,
+      forceMigrate
     });
     return migrateConversationForKeyChange(conversation, source);
   }
@@ -191,7 +241,8 @@ function createGatewayRouter(options = {}) {
     tools,
     stream,
     endpoint,
-    source = {}
+    source = {},
+    requestId = generateRequestId('req')
   }) {
     const token = req.gatewayToken;
     const startedAt = Date.now();
@@ -202,6 +253,27 @@ function createGatewayRouter(options = {}) {
     let stopHeartbeat = () => {};
     const created = Math.floor(Date.now() / 1000);
     const streamId = `chatcmpl_${Date.now()}`;
+
+    // Record initial request log
+    try {
+      database.insertGatewayRequestLog({
+        requestId,
+        tokenId: token?.id || null,
+        tokenName: token?.name || null,
+        endpoint,
+        protocol,
+        downstreamRequestJson: sanitizeForStorage(req.body),
+        downstreamHeadersJson: sanitizeHeaders(req.headers),
+        conversationKey: conversation.conversationKey || null,
+        conversationMode: conversation.mode || null,
+        previousInteractionId: conversation.previousInteractionId || null,
+        model: resolved.requested,
+        backendModel: resolved.backendModel,
+        stream: Boolean(stream),
+        status: 'pending',
+        createdAt: startedAt
+      });
+    } catch {}
 
     if (stream) {
       disableTimeouts(req, res);
@@ -224,30 +296,54 @@ function createGatewayRouter(options = {}) {
         try {
           upstream = pickUpstreamKey(database, masterKey, {
             preferId: switchIndex === 0 ? (conversation.upstreamKeyId || source.stored?.upstream_key_id) : null,
-            excludeIds
+            excludeIds,
+            tpmTracker
           });
         } catch (error) {
           lastError = error;
           break;
         }
 
+        if (switchIndex > 0) {
+          logger.logEvent('warn', 'key_rotated', {
+            requestId,
+            conversationKey: conversation.conversationKey,
+            switchIndex,
+            newUpstreamKeyId: upstream.row.id
+          });
+        }
+
         let conversationForCall = bindConversationToKey(
           conversation,
           upstream,
           source,
-          { forceMigrate: switchIndex > 0 }
+          { forceMigrate: switchIndex > 0, requestId }
         );
 
         for (let attempt = 1; attempt <= RATE_LIMIT_TRIES_PER_KEY; attempt++) {
           const payload = buildPayload({ resolved, conversation: conversationForCall, tools, stream });
-          log('info', 'Gateway forwarding to Interactions API', {
+          try {
+            database.updateGatewayRequestLog(requestId, {
+              upstreamKeyId: upstream.row.id,
+              upstreamKeyName: upstream.row.name,
+              keySwitchCount: switchIndex,
+              retryCount: attempt - 1,
+              upstreamRequestJson: sanitizeForStorage(payload)
+            });
+          } catch {}
+
+          logger.logEvent('info', 'interaction_request', {
+            requestId,
             endpoint,
             model: resolved.requested,
             backendModel: resolved.backendModel,
             mode: conversationForCall.mode,
             stream,
             upstreamKey: upstream.row.id,
-            attempt
+            attempt,
+            conversationKey: conversationForCall.conversationKey,
+            previousInteractionId: conversationForCall.previousInteractionId,
+            environment: conversationForCall.environment
           });
 
           try {
@@ -285,6 +381,8 @@ function createGatewayRouter(options = {}) {
                 const last = result.events[result.events.length - 1];
                 if (last?.id) data.id = last.id;
               }
+              const usage = usageFromInteraction(data);
+              tpmTracker.record(upstream.row.id, usage.totalTokens);
               persistSuccess({
                 database,
                 token,
@@ -297,6 +395,36 @@ function createGatewayRouter(options = {}) {
                 stored: source.stored
               });
               database.markUpstreamKeyUsed(upstream.row.id);
+              try {
+                database.updateGatewayRequestLog(requestId, {
+                  upstreamResponseJson: sanitizeForStorage(data),
+                  upstreamResponseStatus: 200,
+                  responseInteractionId: data.id || null,
+                  responseEnvironmentId: data.environment_id || null,
+                  promptTokens: usage.promptTokens,
+                  completionTokens: usage.completionTokens,
+                  totalTokens: usage.totalTokens,
+                  durationMs: Date.now() - startedAt,
+                  status: 'success'
+                });
+              } catch {}
+              logger.logEvent('info', 'interaction_response', {
+                requestId,
+                endpoint,
+                status: 200,
+                responseInteractionId: data.id,
+                responseEnvironmentId: data.environment_id,
+                responseStatus: data.status,
+                stream: true
+              });
+              if (conversationForCall.mode === 'migrate') {
+                logger.logEvent('info', 'context_migration_succeeded', {
+                  requestId,
+                  conversationKey: conversationForCall.conversationKey,
+                  interactionId: data.id,
+                  environmentId: data.environment_id
+                });
+              }
               if (protocol === 'openai') {
                 emitChatCompletionsFinish({
                   res,
@@ -324,6 +452,8 @@ function createGatewayRouter(options = {}) {
               proxyUrl: upstream.proxyUrl,
               stream: false
             });
+            const usage = usageFromInteraction(data);
+            tpmTracker.record(upstream.row.id, usage.totalTokens);
             persistSuccess({
               database,
               token,
@@ -336,6 +466,36 @@ function createGatewayRouter(options = {}) {
               stored: source.stored
             });
             database.markUpstreamKeyUsed(upstream.row.id);
+            try {
+              database.updateGatewayRequestLog(requestId, {
+                upstreamResponseJson: sanitizeForStorage(data),
+                upstreamResponseStatus: 200,
+                responseInteractionId: data.id || null,
+                responseEnvironmentId: data.environment_id || null,
+                promptTokens: usage.promptTokens,
+                completionTokens: usage.completionTokens,
+                totalTokens: usage.totalTokens,
+                durationMs: Date.now() - startedAt,
+                status: 'success'
+              });
+            } catch {}
+            logger.logEvent('info', 'interaction_response', {
+              requestId,
+              endpoint,
+              status: 200,
+              responseInteractionId: data.id,
+              responseEnvironmentId: data.environment_id,
+              responseStatus: data.status,
+              stream: false
+            });
+            if (conversationForCall.mode === 'migrate') {
+              logger.logEvent('info', 'context_migration_succeeded', {
+                requestId,
+                conversationKey: conversationForCall.conversationKey,
+                interactionId: data.id,
+                environmentId: data.environment_id
+              });
+            }
             if (protocol === 'openai') {
               sendJson(res, 200, toChatCompletion({
                 data,
@@ -353,7 +513,24 @@ function createGatewayRouter(options = {}) {
             if (!isRateLimitError(error)) {
               database.markUpstreamKeyUsed(upstream.row.id, { failed: true });
               persistFailure({ database, token, resolved, endpoint, startedAt, error });
-              log('error', 'Gateway upstream call failed', { message: error.message, code: error.code });
+              try {
+                database.updateGatewayRequestLog(requestId, {
+                  status: 'error',
+                  errorMessage: error.message,
+                  errorCode: error.code || String(error.status || ''),
+                  upstreamResponseStatus: error.status || 500,
+                  upstreamResponseJson: sanitizeForStorage(error.rawError || { error: { message: error.message, code: error.code, status: error.status } }),
+                  durationMs: Date.now() - startedAt
+                });
+              } catch {}
+              logger.logEvent('error', 'interaction_error', {
+                requestId,
+                endpoint,
+                message: error.message,
+                code: error.code,
+                status: error.status,
+                isRateLimit: false
+              });
               if (streamed) {
                 writeSse(res, { error: { message: error.message, type: 'api_error' } });
                 writeSse(res, '[DONE]');
@@ -367,7 +544,18 @@ function createGatewayRouter(options = {}) {
               rateLimited: true,
               cooldownMs: RATE_LIMIT_COOLDOWN_MS
             });
-            log('warn', 'Upstream key rate limited', {
+            try {
+              database.updateGatewayRequestLog(requestId, {
+                status: 'rate_limited',
+                errorMessage: error.message,
+                errorCode: error.code || String(error.status || '429'),
+                upstreamResponseStatus: error.status || 429,
+                upstreamResponseJson: sanitizeForStorage(error.rawError || { error: { message: error.message, code: error.code, status: error.status } }),
+                durationMs: Date.now() - startedAt
+              });
+            } catch {}
+            logger.logEvent('warn', 'key_rate_limited', {
+              requestId,
               upstreamKey: upstream.row.id,
               attempt,
               message: error.message
@@ -385,6 +573,22 @@ function createGatewayRouter(options = {}) {
       const fail = lastError || new Error('All upstream keys failed');
       fail.status = fail.status || 429;
       fail.code = fail.code || 'all_keys_rate_limited';
+      try {
+        database.updateGatewayRequestLog(requestId, {
+          status: 'error',
+          errorMessage: fail.message,
+          errorCode: fail.code || 'all_keys_rate_limited',
+          upstreamResponseStatus: fail.status || 429,
+          upstreamResponseJson: sanitizeForStorage(fail.rawError || { error: { message: fail.message, code: fail.code, status: fail.status } }),
+          durationMs: Date.now() - startedAt
+        });
+      } catch {}
+      logger.logEvent('error', 'all_keys_exhausted', {
+        requestId,
+        message: fail.message,
+        code: fail.code,
+        status: fail.status
+      });
       if (streamed) {
         writeSse(res, { error: { message: fail.message, type: 'api_error', code: fail.code } });
         writeSse(res, '[DONE]');
@@ -402,14 +606,27 @@ function createGatewayRouter(options = {}) {
   function handleModels(req, res) {
     const token = authOrError(req, res, 'openai');
     if (!token) return;
-    sendJson(res, 200, { object: 'list', data: listGatewayModels() });
+    const allowed = token.allowed_models ? JSON.parse(token.allowed_models) : null;
+    let list = listGatewayModels();
+    if (Array.isArray(allowed) && allowed.length > 0) {
+      list = list.filter((m) => allowed.includes(m.id) || (m.parent && allowed.includes(m.id.slice(m.parent.length + 1))));
+    }
+    sendJson(res, 200, { object: 'list', data: list });
   }
 
   async function handleChatCompletions(req, res) {
     const token = authOrError(req, res, 'openai');
     if (!token) return;
     req.gatewayToken = token;
-    const resolved = resolveModel(req.body?.model);
+    let allowedModels = null;
+    if (token.allowed_models) {
+      try { allowedModels = JSON.parse(token.allowed_models); } catch {}
+    }
+    const resolved = resolveModel(req.body?.model, {
+      allowCustom: true,
+      allowedModels,
+      defaultModel: token.default_model || null
+    });
     if (!resolved.ok) {
       sendJson(res, 400, openaiError(400, resolved.error, 'model_not_found').body);
       return;
@@ -418,38 +635,69 @@ function createGatewayRouter(options = {}) {
       sendJson(res, 400, openaiError(400, 'messages is required', 'invalid_request_error').body);
       return;
     }
-    const conversationKey = conversationKeyFrom({
-      messages: req.body.messages,
-      headers: req.headers,
-      body: req.body
-    });
-    const stored = database.getGatewayConversation(token.id, conversationKey);
-    const conversation = buildOpenAIConversation({
-      messages: req.body.messages,
-      headers: req.headers,
-      body: req.body,
-      stored,
-      resolveCallId: (id) => database.resolveGoogleCallId(id)
-    });
-    const tools = mergeTools({ body: req.body, headers: req.headers });
-    await runInteraction({
-      req,
-      res,
-      protocol: 'openai',
-      resolved,
-      conversation,
-      tools,
-      stream: Boolean(req.body?.stream),
-      endpoint: '/v1/chat/completions',
-      source: { messages: req.body.messages, stored }
-    });
+
+    let conversationKey;
+    try {
+      conversationKey = requireConversationKey({
+        messages: req.body.messages,
+        headers: req.headers,
+        body: req.body,
+        enforce: enforceSessionHeader
+      });
+    } catch (err) {
+      sendJson(res, err.status || 400, openaiError(err.status || 400, err.message, err.code || 'invalid_request_error').body);
+      return;
+    }
+
+    const requestId = generateRequestId('req_openai');
+    let releaseLock = () => {};
+    try {
+      releaseLock = await lockManager.acquireLock(conversationKey, { requestId });
+    } catch (lockErr) {
+      sendJson(res, lockErr.status || 429, openaiError(lockErr.status || 429, lockErr.message, lockErr.code || 'session_busy').body);
+      return;
+    }
+
+    try {
+      const stored = database.getGatewayConversation(token.id, conversationKey);
+      const conversation = buildOpenAIConversation({
+        messages: req.body.messages,
+        headers: req.headers,
+        body: req.body,
+        stored,
+        resolveCallId: (id) => database.resolveGoogleCallId(id)
+      });
+      const tools = mergeTools({ body: req.body, headers: req.headers, tokenConfig: token });
+      await runInteraction({
+        req,
+        res,
+        protocol: 'openai',
+        resolved,
+        conversation,
+        tools,
+        stream: Boolean(req.body?.stream),
+        endpoint: '/v1/chat/completions',
+        source: { messages: req.body.messages, stored },
+        requestId
+      });
+    } finally {
+      releaseLock();
+    }
   }
 
   async function handleResponses(req, res) {
     const token = authOrError(req, res, 'openai');
     if (!token) return;
     req.gatewayToken = token;
-    const resolved = resolveModel(req.body?.model);
+    let allowedModels = null;
+    if (token.allowed_models) {
+      try { allowedModels = JSON.parse(token.allowed_models); } catch {}
+    }
+    const resolved = resolveModel(req.body?.model, {
+      allowCustom: true,
+      allowedModels,
+      defaultModel: token.default_model || null
+    });
     if (!resolved.ok) {
       sendJson(res, 400, openaiError(400, resolved.error, 'model_not_found').body);
       return;
@@ -458,35 +706,58 @@ function createGatewayRouter(options = {}) {
       sendJson(res, 400, openaiError(400, 'input is required', 'invalid_request_error').body);
       return;
     }
-    const key = req.body.previous_response_id
-      ? `resp:${req.body.previous_response_id}`
-      : conversationKeyFrom({
-        messages: [],
+
+    let conversationKey;
+    try {
+      conversationKey = req.body.previous_response_id
+        ? `resp:${req.body.previous_response_id}`
+        : requireConversationKey({
+          messages: [],
+          headers: req.headers,
+          body: req.body,
+          enforce: enforceSessionHeader
+        });
+    } catch (err) {
+      sendJson(res, err.status || 400, openaiError(err.status || 400, err.message, err.code || 'invalid_request_error').body);
+      return;
+    }
+
+    const requestId = generateRequestId('req_resp');
+    let releaseLock = () => {};
+    try {
+      releaseLock = await lockManager.acquireLock(conversationKey, { requestId });
+    } catch (lockErr) {
+      sendJson(res, lockErr.status || 429, openaiError(lockErr.status || 429, lockErr.message, lockErr.code || 'session_busy').body);
+      return;
+    }
+
+    try {
+      const stored = database.getGatewayConversation(token.id, conversationKey)
+        || (req.body.previous_response_id
+          ? { interaction_id: req.body.previous_response_id, environment_id: null, prefix_hash: '' }
+          : null);
+      const resolvedStored = database.getGatewayConversation(token.id, conversationKey) || stored;
+      const conversation = buildResponsesConversation({
+        body: req.body,
         headers: req.headers,
-        body: req.body
+        stored: resolvedStored
       });
-    const stored = database.getGatewayConversation(token.id, key)
-      || (req.body.previous_response_id
-        ? { interaction_id: req.body.previous_response_id, environment_id: null, prefix_hash: '' }
-        : null);
-    const resolvedStored = database.getGatewayConversation(token.id, key) || stored;
-    const conversation = buildResponsesConversation({
-      body: req.body,
-      headers: req.headers,
-      stored: resolvedStored
-    });
-    const tools = mergeTools({ body: req.body, headers: req.headers });
-    await runInteraction({
-      req,
-      res,
-      protocol: 'responses',
-      resolved,
-      conversation,
-      tools,
-      stream: Boolean(req.body?.stream),
-      endpoint: '/v1/responses',
-      source: { input: req.body.input, stored: resolvedStored }
-    });
+      const tools = mergeTools({ body: req.body, headers: req.headers, tokenConfig: token });
+      await runInteraction({
+        req,
+        res,
+        protocol: 'responses',
+        resolved,
+        conversation,
+        tools,
+        stream: Boolean(req.body?.stream),
+        endpoint: '/v1/responses',
+        source: { input: req.body.input, stored: resolvedStored },
+        requestId
+      });
+    } finally {
+      releaseLock();
+    }
   }
 
   async function handleGeminiGenerate(req, res, { stream }) {
@@ -494,7 +765,15 @@ function createGatewayRouter(options = {}) {
     if (!token) return;
     req.gatewayToken = token;
     const rawModel = decodeURIComponent(req.params.model || req.body?.model || AGENT_ID);
-    const resolved = resolveModel(rawModel);
+    let allowedModels = null;
+    if (token.allowed_models) {
+      try { allowedModels = JSON.parse(token.allowed_models); } catch {}
+    }
+    const resolved = resolveModel(rawModel, {
+      allowCustom: true,
+      allowedModels,
+      defaultModel: token.default_model || null
+    });
     if (!resolved.ok) {
       sendJson(res, 400, geminiError(400, resolved.error).body);
       return;
@@ -504,42 +783,65 @@ function createGatewayRouter(options = {}) {
       sendJson(res, 400, geminiError(400, 'contents is required').body);
       return;
     }
+
     const conversationProbe = buildGeminiConversation({
       body: req.body,
       headers: req.headers,
       stored: null
     });
-    const stored = database.getGatewayConversation(token.id, conversationProbe.conversationKey);
-    const conversation = buildGeminiConversation({
-      body: req.body,
-      headers: req.headers,
-      stored
-    });
-    const mappedTools = geminiToolsFromBody(req.body);
-    const fakeBody = {
-      tools: mappedTools.map((tool) => (
-        tool.type === 'function'
-          ? { type: 'function', function: tool }
-          : tool
-      )),
-      extra_body: req.body.extra_body,
-      mcp_servers: req.body.mcp_servers
-    };
-    const tools = mergeTools({
-      body: mappedTools.length ? fakeBody : req.body,
-      headers: req.headers
-    });
-    await runInteraction({
-      req,
-      res,
-      protocol: 'gemini',
-      resolved,
-      conversation,
-      tools,
-      stream,
-      endpoint: stream ? ':streamGenerateContent' : ':generateContent',
-      source: { contents, stored }
-    });
+    const conversationKey = conversationProbe.conversationKey;
+
+    if (enforceSessionHeader && !req.headers['x-session-id'] && !req.headers['x-ag-session-id']) {
+      sendJson(res, 400, geminiError(400, 'Missing x-session-id header', 'INVALID_ARGUMENT').body);
+      return;
+    }
+
+    const requestId = generateRequestId('req_gemini');
+    let releaseLock = () => {};
+    try {
+      releaseLock = await lockManager.acquireLock(conversationKey, { requestId });
+    } catch (lockErr) {
+      sendJson(res, lockErr.status || 429, geminiError(lockErr.status || 429, lockErr.message, 'RESOURCE_EXHAUSTED').body);
+      return;
+    }
+
+    try {
+      const stored = database.getGatewayConversation(token.id, conversationKey);
+      const conversation = buildGeminiConversation({
+        body: req.body,
+        headers: req.headers,
+        stored
+      });
+      const mappedTools = geminiToolsFromBody(req.body, token);
+      const fakeBody = {
+        tools: mappedTools.map((tool) => (
+          tool.type === 'function'
+            ? { type: 'function', function: tool }
+            : tool
+        )),
+        extra_body: req.body.extra_body,
+        mcp_servers: req.body.mcp_servers
+      };
+      const tools = mergeTools({
+        body: mappedTools.length ? fakeBody : req.body,
+        headers: req.headers,
+        tokenConfig: token
+      });
+      await runInteraction({
+        req,
+        res,
+        protocol: 'gemini',
+        resolved,
+        conversation,
+        tools,
+        stream,
+        endpoint: stream ? ':streamGenerateContent' : ':generateContent',
+        source: { contents, stored },
+        requestId
+      });
+    } finally {
+      releaseLock();
+    }
   }
 
   router.get('/v1/models', handleModels);

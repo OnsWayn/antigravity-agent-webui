@@ -2,6 +2,7 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 
 export const AGENT_ID = 'antigravity-preview-05-2026';
+export const APP_VERSION = '1.7.0';
 
 export const BACKEND_MODELS = [
   { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', hint: '默认 · 推理 / 编码 / 工具' },
@@ -108,4 +109,64 @@ export function decodeHeader(value) {
 
 export function gatewayModelId(backend) {
   return `${AGENT_ID}/${backend}`;
+}
+
+export function copyText(text) {
+  if (!text) return Promise.resolve();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand('copy');
+  } catch {}
+  document.body.removeChild(textarea);
+  return Promise.resolve();
+}
+
+export function formatDate(timestamp) {
+  if (!timestamp) return '-';
+  const d = new Date(Number(timestamp));
+  if (Number.isNaN(d.getTime())) return String(timestamp);
+  const pad = (n) => String(n).padStart(2, '0');
+  const Y = d.getFullYear();
+  const M = pad(d.getMonth() + 1);
+  const D = pad(d.getDate());
+  const h = pad(d.getHours());
+  const m = pad(d.getMinutes());
+  const s = pad(d.getSeconds());
+  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+}
+
+export function formatTokens(num) {
+  if (num == null || !Number.isFinite(Number(num))) return '-';
+  return Number(num).toLocaleString();
+}
+
+export function formatDuration(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+export function safeJson(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return value;
+    }
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }

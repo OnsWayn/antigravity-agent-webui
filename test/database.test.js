@@ -248,3 +248,116 @@ test('migrates schema v1 without losing sessions, turns, artifacts or errors', (
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Schema V5: manages gateway_request_logs with CRUD, filtering, and auto-cleanup', () => {
+  withDatabase((database) => {
+    const entry1 = database.insertGatewayRequestLog({
+      requestId: 'req_1',
+      tokenId: 'tk-1',
+      tokenName: 'Client 1',
+      endpoint: '/v1/chat/completions',
+      protocol: 'openai',
+      downstreamRequestJson: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hello' }] },
+      upstreamRequestJson: { agent: 'antigravity-preview-05-2026' },
+      conversationKey: 'hdr:qq-1',
+      conversationMode: 'new',
+      model: 'gemini-3.7-flash',
+      backendModel: 'gemini-3.7-flash',
+      status: 'pending',
+      createdAt: Date.now() - 10000
+    });
+    assert.equal(entry1.request_id, 'req_1');
+    assert.equal(entry1.status, 'pending');
+
+    const updated = database.updateGatewayRequestLog('req_1', {
+      status: 'success',
+      upstreamResponseStatus: 200,
+      upstreamResponseJson: { output_text: 'hello response' },
+      promptTokens: 10,
+      completionTokens: 20,
+      totalTokens: 30,
+      durationMs: 1500
+    });
+    assert.equal(updated.status, 'success');
+    assert.equal(updated.total_tokens, 30);
+
+    database.insertGatewayRequestLog({
+      requestId: 'req_2',
+      tokenId: 'tk-2',
+      tokenName: 'Client 2',
+      endpoint: '/v1/chat/completions',
+      protocol: 'openai',
+      downstreamRequestJson: { model: 'gemini-3.6-flash' },
+      conversationKey: 'hdr:qq-2',
+      conversationMode: 'continue',
+      model: 'gemini-3.6-flash',
+      backendModel: 'gemini-3.6-flash',
+      status: 'error',
+      errorMessage: 'Rate limit',
+      createdAt: Date.now()
+    });
+
+    const listAll = database.listGatewayRequestLogs({ limit: 10 });
+    assert.equal(listAll.total, 2);
+    assert.equal(listAll.logs.length, 2);
+
+    const listFiltered = database.listGatewayRequestLogs({ status: 'error' });
+    assert.equal(listFiltered.total, 1);
+    assert.equal(listFiltered.logs[0].request_id, 'req_2');
+
+    const listByToken = database.listGatewayRequestLogs({ tokenId: 'tk-1' });
+    assert.equal(listByToken.total, 1);
+    assert.equal(listByToken.logs[0].request_id, 'req_1');
+
+    const listSearch = database.listGatewayRequestLogs({ search: 'Client 2' });
+    assert.equal(listSearch.total, 1);
+    assert.equal(listSearch.logs[0].request_id, 'req_2');
+
+    // Test cleanup
+    const oldTime = Date.now() - 6 * 86400 * 1000;
+    database.insertGatewayRequestLog({
+      requestId: 'req_old',
+      status: 'success',
+      createdAt: oldTime
+    });
+    assert.equal(database.listGatewayRequestLogs({ limit: 10 }).total, 3);
+    database.cleanOldGatewayRequestLogs({ maxDays: 5 });
+    assert.equal(database.listGatewayRequestLogs({ limit: 10 }).total, 2);
+
+    assert.equal(database.clearGatewayRequestLogs(), 2);
+    assert.equal(database.listGatewayRequestLogs({ limit: 10 }).total, 0);
+  });
+});
+
+test('Schema V5: client_tokens fine control columns and updates', () => {
+  withDatabase((database) => {
+    const token = database.insertClientToken({
+      name: 'Controlled Token',
+      tokenHash: 'hash-ctrl',
+      tokenPrefix: 'ag-ctrl',
+      quotaTokens: 5000,
+      allowedModels: ['gemini-3.7-flash', 'gemini-3.6-flash'],
+      defaultModel: 'gemini-3.6-flash',
+      toolCodeExecution: 1,
+      toolGoogleSearch: 0,
+      toolUrlContext: 1
+    });
+
+    assert.equal(token.name, 'Controlled Token');
+    assert.equal(token.default_model, 'gemini-3.6-flash');
+    assert.deepEqual(JSON.parse(token.allowed_models), ['gemini-3.7-flash', 'gemini-3.6-flash']);
+    assert.equal(token.tool_code_execution, 1);
+    assert.equal(token.tool_google_search, 0);
+    assert.equal(token.tool_url_context, 1);
+
+    const updated = database.updateClientToken(token.id, {
+      toolGoogleSearch: 1,
+      toolUrlContext: 0,
+      allowedModels: ['gemini-3.7-flash']
+    });
+
+    assert.equal(updated.tool_google_search, 1);
+    assert.equal(updated.tool_url_context, 0);
+    assert.deepEqual(JSON.parse(updated.allowed_models), ['gemini-3.7-flash']);
+  });
+});

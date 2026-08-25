@@ -26,6 +26,21 @@ const snapshotCache = new SnapshotCache({
   ttlMs: Number(process.env.SNAPSHOT_CACHE_TTL_MS || 60000)
 });
 
+try {
+  database.cleanOldGatewayRequestLogs({ maxDays: 5, maxDailyBytes: 20 * 1024 * 1024 });
+} catch (err) {
+  console.warn('[Cleanup] Initial gateway log cleanup failed:', err.message);
+}
+
+const logCleanInterval = setInterval(() => {
+  try {
+    database.cleanOldGatewayRequestLogs({ maxDays: 5, maxDailyBytes: 20 * 1024 * 1024 });
+  } catch (err) {
+    console.warn('[Cleanup] Periodic gateway log cleanup failed:', err.message);
+  }
+}, 3600 * 1000);
+if (logCleanInterval.unref) logCleanInterval.unref();
+
 app.use(createOriginGuard({
   port: PORT,
   allowedOrigins: process.env.ALLOWED_ORIGINS || ''

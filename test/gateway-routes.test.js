@@ -77,7 +77,7 @@ function withApp(callUpstream, callback) {
   });
 }
 
-test('rejects unknown models and missing tokens', async () => {
+test('rejects unpermitted models and missing tokens', async () => {
   await withApp(async () => ({}), async ({ base, database }) => {
     const missing = await request(base, '/v1/chat/completions', {
       method: 'POST',
@@ -90,15 +90,16 @@ test('rejects unknown models and missing tokens', async () => {
       name: 'client',
       tokenHash: generated.tokenHash,
       tokenPrefix: generated.tokenPrefix,
-      quotaTokens: -1
+      quotaTokens: -1,
+      allowedModels: ['gemini-3.7-flash']
     });
-    const unknown = await request(base, '/v1/chat/completions', {
+    const unpermitted = await request(base, '/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${generated.token}` },
       body: { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }
     });
-    assert.equal(unknown.status, 400);
-    assert.match(unknown.json.error.message, /Unknown model/);
+    assert.equal(unpermitted.status, 400);
+    assert.match(unpermitted.json.error.message, /not permitted for this token/);
   });
 });
 
@@ -305,5 +306,80 @@ test('gateway paths skip origin rejection', async () => {
       headers: { Origin: 'https://openai-client.example' }
     });
     assert.equal(gateway.status, 401);
+  });
+});
+
+test('gateway request logs are stored and queryable via admin API', async () => {
+  await withApp(async ({ payload }) => {
+    return {
+      id: 'int-logged',
+      status: 'completed',
+      environment_id: 'env-logged',
+      output_text: 'hello logged world',
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello logged world' }] }],
+      usage: { prompt_tokens: 15, completion_tokens: 5, total_tokens: 20 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const encrypted = encryptSecret('gemini-key', masterKey);
+    database.insertUpstreamKey({
+      name: 'KeyAlpha',
+      ciphertext: encrypted.ciphertext,
+      iv: encrypted.iv,
+      tag: encrypted.tag,
+      suffix: 'KeyA'
+    });
+
+    const generated = generateClientToken();
+    const token = database.insertClientToken({
+      name: 'CursorToken',
+      tokenHash: generated.tokenHash,
+      tokenPrefix: generated.tokenPrefix,
+      quotaTokens: -1,
+      toolCodeExecution: 0,
+      toolGoogleSearch: 1,
+      toolUrlContext: 0
+    });
+
+    const headers = {
+      Authorization: `Bearer ${generated.token}`,
+      'x-session-id': 'test-log-session'
+    };
+
+    const res = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'gemini-3.7-flash',
+        messages: [{ role: 'user', content: 'test logs' }]
+      }
+    });
+    assert.equal(res.status, 200);
+
+    // Query admin logs API
+    const logsRes = await request(base, '/api/gateway/logs', {
+      headers: { 'x-admin-token': adminToken }
+    });
+    assert.equal(logsRes.status, 200);
+    assert.equal(logsRes.json.success, true);
+    assert.equal(logsRes.json.total, 1);
+    const logItem = logsRes.json.logs[0];
+    assert.equal(logItem.token_name, 'CursorToken');
+    assert.equal(logItem.status, 'success');
+    assert.equal(logItem.total_tokens, 20);
+
+    // Query single log
+    const singleRes = await request(base, `/api/gateway/logs/${logItem.request_id}`, {
+      headers: { 'x-admin-token': adminToken }
+    });
+    assert.equal(singleRes.status, 200);
+    assert.equal(singleRes.json.log.request_id, logItem.request_id);
+
+    // Clear logs
+    const deleteRes = await request(base, '/api/gateway/logs', {
+      method: 'DELETE',
+      headers: { 'x-admin-token': adminToken }
+    });
+    assert.equal(deleteRes.status, 200);
+    assert.equal(deleteRes.json.cleared, 1);
   });
 });

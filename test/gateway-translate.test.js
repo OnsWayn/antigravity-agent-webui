@@ -100,7 +100,11 @@ test('forks when earlier history is edited', () => {
   assert.equal(edited.mode, 'fork');
   assert.equal(edited.previousInteractionId, undefined);
   assert.equal(edited.environment, 'remote');
-  assert.equal(edited.input, 'next');
+  assert.deepEqual(edited.input, [
+    { type: 'text', text: 'User: CHANGED' },
+    { type: 'text', text: 'Assistant: hi' },
+    { type: 'text', text: 'User: next' }
+  ]);
 });
 
 test('maps trailing tool messages to function_result', () => {
@@ -193,10 +197,19 @@ test('key migration flattens history onto a new sandbox without previous ids', (
   assert.match(String(JSON.stringify(migrated.input)), /NEW sandbox/);
 });
 
-test('resolveModel only allows the probed backend list', () => {
+test('resolveModel supports default backends and custom models', () => {
   assert.equal(resolveGatewayModel('gemini-3.5-flash-lite').backendModel, 'gemini-3.5-flash-lite');
   assert.equal(resolveGatewayModel('antigravity-preview-05-2026/gemini-3.6-flash').backendModel, 'gemini-3.6-flash');
-  assert.equal(resolveGatewayModel('gemini-3.1-pro-preview').ok, false);
+  // Custom model pass-through
+  const custom = resolveGatewayModel('gemini-3.1-pro-preview');
+  assert.equal(custom.ok, true);
+  assert.equal(custom.backendModel, 'gemini-3.1-pro-preview');
+  assert.equal(custom.custom, true);
+  // Disabled custom model
+  assert.equal(resolveGatewayModel('gemini-3.1-pro-preview', { allowCustom: false }).ok, false);
+  // Allowed models filter
+  assert.equal(resolveGatewayModel('gemini-3.5-flash', { allowedModels: ['gemini-3.7-flash'] }).ok, false);
+  assert.equal(resolveGatewayModel('gemini-3.7-flash', { allowedModels: ['gemini-3.7-flash'] }).ok, true);
 });
 
 test('model catalog only lists Antigravity agent ids, not the key Gemini catalog', () => {
@@ -209,4 +222,43 @@ test('model catalog only lists Antigravity agent ids, not the key Gemini catalog
     'antigravity-preview-05-2026/gemini-3.5-flash',
     'antigravity-preview-05-2026/gemini-3.5-flash-lite'
   ]);
+});
+
+test('preserves multi-turn conversation and tool calls history on new and fork modes', () => {
+  const messages = [
+    { role: 'system', content: 'You are an assistant' },
+    { role: 'user', content: 'read file foo.txt' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"foo.txt"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', name: 'read_file', content: 'hello world contents' },
+    { role: 'assistant', content: 'file content is hello world' },
+    { role: 'user', content: 'what was in the file?' }
+  ];
+
+  // New mode with pre-existing multi-turn history
+  const convNew = buildOpenAIConversation({ messages, stored: null });
+  assert.equal(convNew.mode, 'new');
+  assert.equal(convNew.previousInteractionId, undefined);
+  assert.equal(Array.isArray(convNew.input), true);
+  const inputStr = JSON.stringify(convNew.input);
+  assert.match(inputStr, /read file foo\.txt/);
+  assert.match(inputStr, /Tool result \(read_file\): hello world contents/);
+  assert.match(inputStr, /file content is hello world/);
+  assert.match(inputStr, /what was in the file\?/);
+
+  // Fork mode with mismatched prefix hash
+  const convFork = buildOpenAIConversation({
+    messages,
+    stored: {
+      interaction_id: 'old-int',
+      environment_id: 'old-env',
+      prefix_hash: 'mismatched-hash'
+    }
+  });
+  assert.equal(convFork.mode, 'fork');
+  assert.equal(convFork.previousInteractionId, undefined);
+  assert.equal(Array.isArray(convFork.input), true);
+  const forkInputStr = JSON.stringify(convFork.input);
+  assert.match(forkInputStr, /read file foo\.txt/);
+  assert.match(forkInputStr, /Tool result \(read_file\): hello world contents/);
+  assert.match(forkInputStr, /what was in the file\?/);
 });

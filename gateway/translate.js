@@ -155,6 +155,18 @@ function flattenMessagesToInput(messages) {
     }
     const converted = openaiMessageToInputParts(message);
     const label = message.role === 'assistant' ? 'Assistant' : 'User';
+
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      const callsText = message.tool_calls.map((c) => {
+        const fn = c.function || c;
+        return `${fn.name || 'tool'}(${typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {})})`;
+      }).join(', ');
+      const contentText = typeof converted === 'string' ? converted : (Array.isArray(converted) ? converted.map((p) => p.text || '').join('\n') : '');
+      const text = contentText ? `${contentText}\n[Calls: ${callsText}]` : `[Calls: ${callsText}]`;
+      parts.push({ type: 'text', text: `${label}: ${text}` });
+      continue;
+    }
+
     if (typeof converted === 'string') {
       if (converted) parts.push({ type: 'text', text: `${label}: ${converted}` });
     } else if (Array.isArray(converted)) {
@@ -193,6 +205,34 @@ function conversationKeyFrom({ messages, headers = {}, body = {} }) {
   if (body.previous_response_id) return `resp:${body.previous_response_id}`;
   const sessionId = headers['x-session-id'] || headers['x-ag-session-id'];
   if (sessionId) return `hdr:${sessionId}`;
+  // Fallback: use fingerprint of first user message.
+  // This is inherently unsafe for multi-session scenarios (two windows sending
+  // identical first messages will collide), but we keep it for backward
+  // compatibility when enforce_session_header is disabled.
+  const user = (messages || []).find((message) => message.role === 'user');
+  return `fp:${sha256(textOfMessage(user))}`;
+}
+
+/**
+ * 验证请求中是否包含稳定的 session 标识。
+ * 当 enforce 为 true 时，缺少 header 会抛出 400 错误。
+ * @param {object} params - 包含 headers、body 和 enforce 标志
+ * @returns {string} conversationKey
+ */
+function requireConversationKey({ messages, headers = {}, body = {}, enforce = false }) {
+  if (body.previous_response_id) return `resp:${body.previous_response_id}`;
+  const sessionId = headers['x-session-id'] || headers['x-ag-session-id'];
+  if (sessionId) return `hdr:${sessionId}`;
+  if (enforce) {
+    const error = new Error(
+      'Missing x-session-id or x-ag-session-id header. '
+      + 'A stable session identifier is required to prevent conversation cross-talk. '
+      + 'Set it to a unique value per QQ conversation window (e.g. qq:private:{user_id} or qq:group:{group_id}).'
+    );
+    error.status = 400;
+    error.code = 'missing_session_id';
+    throw error;
+  }
   const user = (messages || []).find((message) => message.role === 'user');
   return `fp:${sha256(textOfMessage(user))}`;
 }
@@ -249,9 +289,12 @@ function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = n
     ? toolMessages.map((message) => toFunctionResult(message, resolveCallId))
     : openaiMessageToInputParts(last || lastUserMessage(msgs));
 
+  const withoutSystem = msgs.filter((m) => m.role !== 'system');
+  const isMultiTurn = withoutSystem.length > 1;
+
   if (!stored) {
     return {
-      input,
+      input: isMultiTurn ? flattenMessagesToInput(msgs) : input,
       environment: 'remote',
       previousInteractionId: undefined,
       systemInstruction,
@@ -263,9 +306,26 @@ function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = n
   }
 
   if (stored.prefix_hash !== prefixHash) {
-    const user = lastUserMessage(msgs) || last;
+    const prefixWithoutSystem = isToolTurn
+      ? withoutSystem.slice(0, withoutSystem.length - toolMessages.length)
+      : withoutSystem.slice(0, -1);
+    const storedWithoutSystem = hashNonAssistant(prefixWithoutSystem);
+
+    if (storedWithoutSystem === stored.prefix_hash && stored.interaction_id) {
+      return {
+        input,
+        environment: stored.environment_id || 'remote',
+        previousInteractionId: stored.interaction_id,
+        systemInstruction,
+        conversationKey,
+        nextPrefixHash,
+        mode: 'continue',
+        upstreamKeyId: stored.upstream_key_id || null
+      };
+    }
+
     return {
-      input: openaiMessageToInputParts(user),
+      input: isMultiTurn ? flattenMessagesToInput(msgs) : openaiMessageToInputParts(lastUserMessage(msgs) || last),
       environment: reuseEnv && stored.environment_id ? stored.environment_id : 'remote',
       previousInteractionId: undefined,
       systemInstruction,
@@ -316,7 +376,7 @@ function normalizeMcpServer(server) {
   return mapped;
 }
 
-function mergeTools({ body = {}, headers = {}, includeBuiltin }) {
+function mergeTools({ body = {}, headers = {}, includeBuiltin, tokenConfig = {} }) {
   const clientTools = [];
   const openaiTools = Array.isArray(body.tools) ? body.tools : [];
   for (const tool of openaiTools) {
@@ -336,9 +396,22 @@ function mergeTools({ body = {}, headers = {}, includeBuiltin }) {
   const headerDisable = headers['x-ag-antigravity-tools'] === 'false' || extra.antigravity_tools === false;
   const wantBuiltin = includeBuiltin !== false && !headerDisable;
 
-  if (!clientTools.length) return wantBuiltin ? undefined : [];
-  if (!wantBuiltin) return clientTools;
-  return [...DEFAULT_ANTIGRAVITY_TOOLS, ...clientTools];
+  const builtinTools = [];
+  if (wantBuiltin) {
+    if (tokenConfig.tool_code_execution !== 0 && tokenConfig.toolCodeExecution !== 0) {
+      builtinTools.push({ type: 'code_execution' });
+    }
+    if (tokenConfig.tool_google_search !== 0 && tokenConfig.toolGoogleSearch !== 0) {
+      builtinTools.push({ type: 'google_search' });
+    }
+    if (tokenConfig.tool_url_context !== 0 && tokenConfig.toolUrlContext !== 0) {
+      builtinTools.push({ type: 'url_context' });
+    }
+  }
+
+  if (!clientTools.length) return builtinTools.length ? builtinTools : undefined;
+  if (!builtinTools.length) return clientTools;
+  return [...builtinTools, ...clientTools];
 }
 
 function pendingFunctionCalls(data) {
@@ -588,7 +661,7 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
 
   if (!stored) {
     return {
-      input,
+      input: contents.length > 1 ? flattenGeminiContents(contents) : input,
       environment: 'remote',
       previousInteractionId: undefined,
       systemInstruction,
@@ -600,7 +673,7 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
   }
   if (stored.prefix_hash !== prefixHash) {
     return {
-      input,
+      input: contents.length > 1 ? flattenGeminiContents(contents) : input,
       environment: reuseEnv && stored.environment_id ? stored.environment_id : 'remote',
       previousInteractionId: undefined,
       systemInstruction,
@@ -622,7 +695,7 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
   };
 }
 
-function geminiToolsFromBody(body) {
+function geminiToolsFromBody(body, tokenConfig = {}) {
   const mapped = [];
   for (const tool of body?.tools || []) {
     if (tool.functionDeclarations || tool.function_declarations) {
@@ -636,9 +709,15 @@ function geminiToolsFromBody(body) {
       const mappedMcp = normalizeMcpServer(tool.mcp_server || tool);
       if (mappedMcp) mapped.push(mappedMcp);
     }
-    if (tool.google_search || tool.googleSearch) mapped.push({ type: 'google_search' });
-    if (tool.code_execution || tool.codeExecution) mapped.push({ type: 'code_execution' });
-    if (tool.url_context || tool.urlContext) mapped.push({ type: 'url_context' });
+    if ((tool.google_search || tool.googleSearch) && tokenConfig.tool_google_search !== 0 && tokenConfig.toolGoogleSearch !== 0) {
+      mapped.push({ type: 'google_search' });
+    }
+    if ((tool.code_execution || tool.codeExecution) && tokenConfig.tool_code_execution !== 0 && tokenConfig.toolCodeExecution !== 0) {
+      mapped.push({ type: 'code_execution' });
+    }
+    if ((tool.url_context || tool.urlContext) && tokenConfig.tool_url_context !== 0 && tokenConfig.toolUrlContext !== 0) {
+      mapped.push({ type: 'url_context' });
+    }
   }
   return mapped;
 }
@@ -729,16 +808,54 @@ function withMigrationPreamble(input) {
 
 function migrateConversationForKeyChange(conversation, source = {}) {
   const { messages, contents, stored } = source;
+
+  // Detect if the current input contains function_result items.
+  // If so, we must preserve their structure and provide task recovery context
+  // instead of blindly flattening everything to plain text.
+  const currentInput = conversation.input;
+  const hasFunctionResults = Array.isArray(currentInput)
+    && currentInput.some((item) => item && item.type === 'function_result');
+
+  if (hasFunctionResults) {
+    // Build a recovery context that explains the situation to the model,
+    // while preserving the function_result items with their call_id intact.
+    const recoveryParts = [
+      { type: 'text', text: MIGRATION_NOTE },
+      { type: 'text', text: buildToolRecoveryContext(currentInput, source) }
+    ];
+
+    // Include the original function_result items with full structure preserved
+    for (const item of currentInput) {
+      if (item && item.type === 'function_result') {
+        recoveryParts.push(item);
+      }
+    }
+
+    return {
+      ...conversation,
+      input: recoveryParts,
+      environment: 'remote',
+      previousInteractionId: undefined,
+      mode: 'migrate',
+      upstreamKeyId: null
+    };
+  }
+
+  // Non-tool-result migration: use messages / contents or transcript
   let input;
-  if (Array.isArray(messages) && messages.length > 0) {
+  const transcript = parseTranscript(stored);
+  if (Array.isArray(messages) && messages.length > 1) {
+    input = flattenMessagesToInput(messages);
+  } else if (Array.isArray(contents) && contents.length > 1) {
+    input = flattenGeminiContents(contents);
+  } else if (transcript.length > 0) {
+    input = transcriptToInput(transcript, conversation.input);
+  } else if (Array.isArray(messages) && messages.length > 0) {
     input = flattenMessagesToInput(messages);
   } else if (Array.isArray(contents) && contents.length > 0) {
     input = flattenGeminiContents(contents);
   } else {
-    const transcript = parseTranscript(stored);
-    input = transcript.length
-      ? transcriptToInput(transcript, conversation.input)
-      : conversation.input;
+    input = conversation.input;
   }
   return {
     ...conversation,
@@ -748,6 +865,68 @@ function migrateConversationForKeyChange(conversation, source = {}) {
     mode: 'migrate',
     upstreamKeyId: null
   };
+}
+
+/**
+ * 为工具调用迁移构建恢复上下文。
+ * 描述未完成的工具调用和结果，以便新 Interaction 链能理解这些 function_result。
+ * @param {Array} input - 当前包含 function_result 的 input 数组
+ * @param {object} source - 原始请求源数据
+ * @returns {string} 恢复上下文文本
+ */
+function buildToolRecoveryContext(input, source = {}) {
+  const results = (input || []).filter((item) => item && item.type === 'function_result');
+  const historyParts = [];
+
+  if (Array.isArray(source.messages) && source.messages.length > 0) {
+    const nonToolMsgs = source.messages.filter((m) => m.role !== 'tool' && m.role !== 'function');
+    const flattened = flattenMessagesToInput(nonToolMsgs);
+    if (typeof flattened === 'string' && flattened.trim()) {
+      historyParts.push(flattened);
+    } else if (Array.isArray(flattened)) {
+      for (const part of flattened) {
+        if (part.type === 'text' && part.text) historyParts.push(part.text);
+      }
+    }
+  } else if (Array.isArray(source.contents) && source.contents.length > 0) {
+    const flattened = flattenGeminiContents(source.contents);
+    if (typeof flattened === 'string' && flattened.trim()) {
+      historyParts.push(flattened);
+    } else if (Array.isArray(flattened)) {
+      for (const part of flattened) {
+        if (part.type === 'text' && part.text) historyParts.push(part.text);
+      }
+    }
+  } else {
+    const transcript = parseTranscript(source.stored);
+    for (const turn of transcript) {
+      const role = turn.role === 'assistant' ? 'Assistant' : 'User';
+      const text = String(turn.text || '');
+      if (text) historyParts.push(`${role}: ${text}`);
+    }
+  }
+
+  const parts = [];
+  parts.push('This is a task continuation after an API key rotation. The previous interaction chain is no longer accessible.');
+
+  if (historyParts.length) {
+    parts.push('');
+    parts.push('Complete conversation history:');
+    parts.push(historyParts.join('\n\n'));
+  }
+
+  parts.push('');
+  parts.push(`The previous interaction requested ${results.length} tool call(s). The tool(s) have been executed and their results follow as function_result items.`);
+  for (const result of results) {
+    const preview = Array.isArray(result.result)
+      ? result.result.map((r) => String(r.text || '')).join('; ')
+      : '(no preview)';
+    parts.push(`  - Tool: ${result.name || 'unknown'}, call_id: ${result.call_id || 'unknown'}, result preview: ${preview}`);
+  }
+  parts.push('');
+  parts.push('Please process the tool results and continue the task. Do NOT re-execute the tools — they have already completed successfully.');
+
+  return parts.join('\n');
 }
 
 function appendTranscript(stored, conversation, outputText) {
@@ -789,6 +968,7 @@ module.exports = {
   openaiMessageToInputParts,
   flattenMessagesToInput,
   conversationKeyFrom,
+  requireConversationKey,
   buildOpenAIConversation,
   buildResponsesConversation,
   buildGeminiConversation,

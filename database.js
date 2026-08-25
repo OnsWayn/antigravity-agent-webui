@@ -247,9 +247,11 @@ class AppDatabase {
       this.createSchemaV2();
       this.createSchemaV3();
       this.createSchemaV4();
+      this.createSchemaV5();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(Date.now());
       return;
     }
 
@@ -267,6 +269,10 @@ class AppDatabase {
     if (version < 4) {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
     }
+    this.createSchemaV5();
+    if (version < 5) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(Date.now());
+    }
   }
 
   columnExists(table, name) {
@@ -279,11 +285,68 @@ class AppDatabase {
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${spec}`);
   }
 
+  createSchemaV5() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS gateway_request_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL UNIQUE,
+        token_id TEXT,
+        token_name TEXT,
+        upstream_key_id TEXT,
+        upstream_key_name TEXT,
+        endpoint TEXT,
+        protocol TEXT,
+        downstream_request_json TEXT,
+        downstream_headers_json TEXT,
+        upstream_request_json TEXT,
+        upstream_response_json TEXT,
+        upstream_response_status INTEGER,
+        conversation_key TEXT,
+        conversation_mode TEXT,
+        previous_interaction_id TEXT,
+        response_interaction_id TEXT,
+        response_environment_id TEXT,
+        model TEXT,
+        backend_model TEXT,
+        stream INTEGER DEFAULT 0,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        duration_ms INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_message TEXT,
+        error_code TEXT,
+        key_switch_count INTEGER DEFAULT 0,
+        retry_count INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_gateway_request_logs_created 
+        ON gateway_request_logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_gateway_request_logs_token 
+        ON gateway_request_logs(token_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_gateway_request_logs_status 
+        ON gateway_request_logs(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_gateway_request_logs_conversation 
+        ON gateway_request_logs(conversation_key, created_at DESC);
+    `);
+
+    if (this.tableExists('client_tokens')) {
+      this.ensureColumn('client_tokens', 'allowed_models', 'TEXT');
+      this.ensureColumn('client_tokens', 'default_model', 'TEXT');
+      this.ensureColumn('client_tokens', 'tool_code_execution', 'INTEGER NOT NULL DEFAULT 1');
+      this.ensureColumn('client_tokens', 'tool_google_search', 'INTEGER NOT NULL DEFAULT 1');
+      this.ensureColumn('client_tokens', 'tool_url_context', 'INTEGER NOT NULL DEFAULT 1');
+    }
+  }
+
   createSchemaV4() {
     if (!this.tableExists('upstream_keys') || !this.tableExists('gateway_conversations')) return;
     this.ensureColumn('upstream_keys', 'cooldown_until', 'INTEGER');
     this.ensureColumn('gateway_conversations', 'upstream_key_id', 'TEXT');
     this.ensureColumn('gateway_conversations', 'transcript_json', 'TEXT');
+    this.ensureColumn('gateway_conversations', 'context_version', 'INTEGER NOT NULL DEFAULT 1');
+    this.ensureColumn('gateway_conversations', 'created_at', 'INTEGER');
   }
 
   createSchemaV3() {
@@ -313,6 +376,11 @@ class AppDatabase {
         rpm INTEGER,
         enabled INTEGER NOT NULL DEFAULT 1,
         expires_at INTEGER,
+        allowed_models TEXT,
+        default_model TEXT,
+        tool_code_execution INTEGER NOT NULL DEFAULT 1,
+        tool_google_search INTEGER NOT NULL DEFAULT 1,
+        tool_url_context INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -344,6 +412,8 @@ class AppDatabase {
         environment_id TEXT,
         prefix_hash TEXT,
         model TEXT,
+        context_version INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (token_id, conversation_key)
       );
@@ -713,14 +783,30 @@ class AppDatabase {
     `).run(now, now, id);
   }
 
-  insertClientToken({ id, name, tokenHash, tokenPrefix, quotaTokens, rpm, expiresAt }) {
+  insertClientToken({
+    id,
+    name,
+    tokenHash,
+    tokenPrefix,
+    quotaTokens,
+    rpm,
+    expiresAt,
+    allowedModels = null,
+    defaultModel = null,
+    toolCodeExecution = 1,
+    toolGoogleSearch = 1,
+    toolUrlContext = 1
+  }) {
     const now = Date.now();
     const tokenId = id || `tk-${crypto.randomUUID()}`;
+    const allowed = Array.isArray(allowedModels) ? json(allowedModels) : (allowedModels || null);
     this.db.prepare(`
       INSERT INTO client_tokens (
         id, name, token_hash, token_prefix, quota_tokens, used_tokens,
-        rpm, enabled, expires_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?)
+        rpm, enabled, expires_at, allowed_models, default_model,
+        tool_code_execution, tool_google_search, tool_url_context,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       tokenId,
       name || 'API Token',
@@ -729,6 +815,11 @@ class AppDatabase {
       Number.isFinite(quotaTokens) ? quotaTokens : -1,
       Number.isFinite(rpm) ? rpm : null,
       expiresAt || null,
+      allowed,
+      defaultModel || null,
+      toolCodeExecution === 0 ? 0 : 1,
+      toolGoogleSearch === 0 ? 0 : 1,
+      toolUrlContext === 0 ? 0 : 1,
       now,
       now
     );
@@ -751,6 +842,9 @@ class AppDatabase {
     const existing = this.getClientToken(id);
     if (!existing) return null;
     const now = Date.now();
+    const allowed = fields.allowedModels !== undefined
+      ? (Array.isArray(fields.allowedModels) ? json(fields.allowedModels) : fields.allowedModels)
+      : existing.allowed_models;
     this.db.prepare(`
       UPDATE client_tokens SET
         name = ?,
@@ -758,6 +852,11 @@ class AppDatabase {
         rpm = ?,
         enabled = ?,
         expires_at = ?,
+        allowed_models = ?,
+        default_model = ?,
+        tool_code_execution = ?,
+        tool_google_search = ?,
+        tool_url_context = ?,
         updated_at = ?
       WHERE id = ?
     `).run(
@@ -766,6 +865,11 @@ class AppDatabase {
       fields.rpm !== undefined ? fields.rpm : existing.rpm,
       fields.enabled !== undefined ? (fields.enabled ? 1 : 0) : existing.enabled,
       fields.expiresAt !== undefined ? fields.expiresAt : existing.expires_at,
+      allowed,
+      fields.defaultModel !== undefined ? fields.defaultModel : existing.default_model,
+      fields.toolCodeExecution !== undefined ? (fields.toolCodeExecution ? 1 : 0) : existing.tool_code_execution,
+      fields.toolGoogleSearch !== undefined ? (fields.toolGoogleSearch ? 1 : 0) : existing.tool_google_search,
+      fields.toolUrlContext !== undefined ? (fields.toolUrlContext ? 1 : 0) : existing.tool_url_context,
       now,
       id
     );
@@ -840,8 +944,8 @@ class AppDatabase {
     this.db.prepare(`
       INSERT INTO gateway_conversations (
         token_id, conversation_key, interaction_id, environment_id, prefix_hash, model,
-        updated_at, upstream_key_id, transcript_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        updated_at, upstream_key_id, transcript_json, context_version, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(token_id, conversation_key) DO UPDATE SET
         interaction_id = excluded.interaction_id,
         environment_id = excluded.environment_id,
@@ -849,7 +953,9 @@ class AppDatabase {
         model = COALESCE(excluded.model, gateway_conversations.model),
         updated_at = excluded.updated_at,
         upstream_key_id = excluded.upstream_key_id,
-        transcript_json = COALESCE(excluded.transcript_json, gateway_conversations.transcript_json)
+        transcript_json = COALESCE(excluded.transcript_json, gateway_conversations.transcript_json),
+        context_version = COALESCE(gateway_conversations.context_version, 0) + 1,
+        created_at = COALESCE(gateway_conversations.created_at, excluded.created_at)
     `).run(
       tokenId,
       conversationKey,
@@ -859,7 +965,8 @@ class AppDatabase {
       model || null,
       now,
       upstreamKeyId || null,
-      transcript == null ? null : json(transcript)
+      transcript == null ? null : json(transcript),
+      now
     );
   }
 
@@ -880,6 +987,243 @@ class AppDatabase {
   resolveGoogleCallId(openaiCallId) {
     const row = this.getGatewayToolCall(openaiCallId);
     return row?.google_call_id || openaiCallId;
+  }
+
+  insertGatewayRequestLog(entry) {
+    if (!entry?.requestId) return null;
+    const now = Number(entry.createdAt || Date.now());
+    this.db.prepare(`
+      INSERT INTO gateway_request_logs (
+        request_id, token_id, token_name, upstream_key_id, upstream_key_name,
+        endpoint, protocol, downstream_request_json, downstream_headers_json,
+        upstream_request_json, upstream_response_json, upstream_response_status,
+        conversation_key, conversation_mode, previous_interaction_id,
+        response_interaction_id, response_environment_id,
+        model, backend_model, stream, prompt_tokens, completion_tokens,
+        total_tokens, duration_ms, status, error_message, error_code,
+        key_switch_count, retry_count, created_at
+      ) VALUES (
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?
+      )
+    `).run(
+      entry.requestId,
+      entry.tokenId || null,
+      entry.tokenName || null,
+      entry.upstreamKeyId || null,
+      entry.upstreamKeyName || null,
+      entry.endpoint || null,
+      entry.protocol || null,
+      typeof entry.downstreamRequestJson === 'string' ? entry.downstreamRequestJson : json(entry.downstreamRequestJson),
+      typeof entry.downstreamHeadersJson === 'string' ? entry.downstreamHeadersJson : json(entry.downstreamHeadersJson),
+      typeof entry.upstreamRequestJson === 'string' ? entry.upstreamRequestJson : json(entry.upstreamRequestJson),
+      typeof entry.upstreamResponseJson === 'string' ? entry.upstreamResponseJson : json(entry.upstreamResponseJson),
+      entry.upstreamResponseStatus != null ? Number(entry.upstreamResponseStatus) : null,
+      entry.conversationKey || null,
+      entry.conversationMode || null,
+      entry.previousInteractionId || null,
+      entry.responseInteractionId || null,
+      entry.responseEnvironmentId || null,
+      entry.model || null,
+      entry.backendModel || null,
+      entry.stream ? 1 : 0,
+      entry.promptTokens != null ? Number(entry.promptTokens) : null,
+      entry.completionTokens != null ? Number(entry.completionTokens) : null,
+      entry.totalTokens != null ? Number(entry.totalTokens) : null,
+      entry.durationMs != null ? Number(entry.durationMs) : null,
+      entry.status || 'pending',
+      entry.errorMessage || null,
+      entry.errorCode || null,
+      Number(entry.keySwitchCount || 0),
+      Number(entry.retryCount || 0),
+      now
+    );
+    return this.getGatewayRequestLog(entry.requestId);
+  }
+
+  updateGatewayRequestLog(requestId, updates = {}) {
+    if (!requestId) return null;
+    const existing = this.getGatewayRequestLog(requestId);
+    if (!existing) return null;
+
+    const fields = [];
+    const params = [];
+
+    const fieldMap = {
+      tokenId: 'token_id',
+      tokenName: 'token_name',
+      upstreamKeyId: 'upstream_key_id',
+      upstreamKeyName: 'upstream_key_name',
+      endpoint: 'endpoint',
+      protocol: 'protocol',
+      downstreamRequestJson: 'downstream_request_json',
+      downstreamHeadersJson: 'downstream_headers_json',
+      upstreamRequestJson: 'upstream_request_json',
+      upstreamResponseJson: 'upstream_response_json',
+      upstreamResponseStatus: 'upstream_response_status',
+      conversationKey: 'conversation_key',
+      conversationMode: 'conversation_mode',
+      previousInteractionId: 'previous_interaction_id',
+      responseInteractionId: 'response_interaction_id',
+      responseEnvironmentId: 'response_environment_id',
+      model: 'model',
+      backendModel: 'backend_model',
+      stream: 'stream',
+      promptTokens: 'prompt_tokens',
+      completionTokens: 'completion_tokens',
+      totalTokens: 'total_tokens',
+      durationMs: 'duration_ms',
+      status: 'status',
+      errorMessage: 'error_message',
+      errorCode: 'error_code',
+      keySwitchCount: 'key_switch_count',
+      retryCount: 'retry_count'
+    };
+
+    for (const [key, col] of Object.entries(fieldMap)) {
+      if (updates[key] !== undefined) {
+        fields.push(`${col} = ?`);
+        let val = updates[key];
+        if (col.endsWith('_json') && typeof val !== 'string' && val !== null) {
+          val = json(val);
+        } else if (col === 'stream') {
+          val = val ? 1 : 0;
+        }
+        params.push(val);
+      }
+    }
+
+    if (!fields.length) return existing;
+
+    params.push(requestId);
+    this.db.prepare(`
+      UPDATE gateway_request_logs SET ${fields.join(', ')} WHERE request_id = ?
+    `).run(...params);
+
+    return this.getGatewayRequestLog(requestId);
+  }
+
+  getGatewayRequestLog(requestId) {
+    if (!requestId) return null;
+    return this.db.prepare('SELECT * FROM gateway_request_logs WHERE request_id = ?').get(requestId) || null;
+  }
+
+  listGatewayRequestLogs({
+    limit = 50,
+    offset = 0,
+    status,
+    tokenId,
+    conversationKey,
+    startTime,
+    endTime,
+    search
+  } = {}) {
+    const cap = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const off = Math.max(Number(offset) || 0, 0);
+    const conditions = [];
+    const params = [];
+
+    if (status) {
+      conditions.push('status = ?');
+      params.push(status);
+    }
+    if (tokenId) {
+      conditions.push('token_id = ?');
+      params.push(tokenId);
+    }
+    if (conversationKey) {
+      conditions.push('conversation_key = ?');
+      params.push(conversationKey);
+    }
+    if (startTime) {
+      conditions.push('created_at >= ?');
+      params.push(Number(startTime));
+    }
+    if (endTime) {
+      conditions.push('created_at <= ?');
+      params.push(Number(endTime));
+    }
+    if (search) {
+      conditions.push('(request_id LIKE ? OR token_name LIKE ? OR upstream_key_name LIKE ? OR endpoint LIKE ? OR model LIKE ? OR error_message LIKE ? OR conversation_key LIKE ?)');
+      const s = `%${search}%`;
+      params.push(s, s, s, s, s, s, s);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const countRow = this.db.prepare(`SELECT COUNT(*) AS total FROM gateway_request_logs ${whereClause}`).get(...params);
+    const total = Number(countRow?.total || 0);
+
+    const rows = this.db.prepare(`
+      SELECT * FROM gateway_request_logs
+      ${whereClause}
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, cap, off);
+
+    return {
+      total,
+      limit: cap,
+      offset: off,
+      logs: rows
+    };
+  }
+
+  clearGatewayRequestLogs() {
+    return this.db.prepare('DELETE FROM gateway_request_logs').run().changes;
+  }
+
+  cleanOldGatewayRequestLogs({ maxDays = 5, maxDailyBytes = 20 * 1024 * 1024 } = {}) {
+    const cutoff = Date.now() - (Number(maxDays) || 5) * 86400 * 1000;
+    this.db.prepare('DELETE FROM gateway_request_logs WHERE created_at < ?').run(cutoff);
+
+    // Group by day for remaining window and prune oldest logs if over maxDailyBytes
+    const dayRows = this.db.prepare(`
+      SELECT
+        CAST(created_at / 86400000 AS INT) AS day_idx,
+        SUM(
+          COALESCE(LENGTH(downstream_request_json), 0) +
+          COALESCE(LENGTH(upstream_request_json), 0) +
+          COALESCE(LENGTH(upstream_response_json), 0)
+        ) AS total_bytes
+      FROM gateway_request_logs
+      GROUP BY day_idx
+      HAVING total_bytes > ?
+    `).all(Number(maxDailyBytes) || 20 * 1024 * 1024);
+
+    for (const day of dayRows) {
+      const dayStart = day.day_idx * 86400000;
+      const dayEnd = dayStart + 86400000;
+      const logs = this.db.prepare(`
+        SELECT id,
+          (COALESCE(LENGTH(downstream_request_json), 0) +
+           COALESCE(LENGTH(upstream_request_json), 0) +
+           COALESCE(LENGTH(upstream_response_json), 0)) AS row_bytes
+        FROM gateway_request_logs
+        WHERE created_at >= ? AND created_at < ?
+        ORDER BY created_at ASC
+      `).all(dayStart, dayEnd);
+
+      let currentBytes = day.total_bytes;
+      const idsToDelete = [];
+      for (const log of logs) {
+        if (currentBytes <= maxDailyBytes) break;
+        idsToDelete.push(log.id);
+        currentBytes -= (log.row_bytes || 0);
+      }
+
+      if (idsToDelete.length) {
+        for (let i = 0; i < idsToDelete.length; i += 500) {
+          const chunk = idsToDelete.slice(i, i + 500);
+          this.db.prepare(`DELETE FROM gateway_request_logs WHERE id IN (${chunk.map(() => '?').join(',')})`).run(...chunk);
+        }
+      }
+    }
   }
 
   close() {

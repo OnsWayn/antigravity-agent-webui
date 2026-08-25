@@ -148,10 +148,13 @@ async function callInteractions({
   }
 
   if (!response.ok) {
-    const details = data.error || {};
-    const error = new Error(details.message || `Gemini API HTTP ${response.status}`);
+    const errObj = Array.isArray(data) ? (data[0] || {}) : data;
+    const details = errObj.error || errObj || {};
+    const message = details.message || errObj.message || (typeof errObj === 'string' ? errObj : `Gemini API HTTP ${response.status}`);
+    const code = details.status || details.code || details.reason || `HTTP_${response.status}`;
+    const error = new Error(message);
     error.status = response.status;
-    error.code = details.status || details.code || `HTTP_${response.status}`;
+    error.code = code;
     error.rawError = data;
     throw error;
   }

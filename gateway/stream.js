@@ -167,6 +167,7 @@ function applyStreamEvent(event, state) {
   if (event.status) next.status = event.status;
   if (event.usage) next.usage = event.usage;
   if (event.environment_id) next.environmentId = event.environment_id;
+  if (event.interaction?.environment_id) next.environmentId = event.interaction.environment_id;
   const type = event.event_type || event.type;
   if (type === 'step.delta' && event.delta?.type === 'text' && event.delta.text) {
     next.text += event.delta.text;

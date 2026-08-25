@@ -28,7 +28,51 @@ function decryptKeyRow(row, masterKey) {
   };
 }
 
-function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now = Date.now() } = {}) {
+class TpmTracker {
+  constructor({ windowMs = 60000, limitTpm = 100000, thresholdRatio = 0.8 } = {}) {
+    this.windowMs = windowMs;
+    this.limitTpm = limitTpm;
+    this.thresholdRatio = thresholdRatio;
+    this.records = new Map();
+  }
+
+  record(keyId, tokens, timestamp = Date.now()) {
+    if (!keyId || !Number.isFinite(tokens) || tokens <= 0) return;
+    const list = this.records.get(keyId) || [];
+    list.push({ tokens: Number(tokens), timestamp: Number(timestamp) });
+    this.records.set(keyId, list);
+    this.prune(keyId, timestamp);
+  }
+
+  prune(keyId, now = Date.now()) {
+    const cutoff = now - this.windowMs;
+    const list = this.records.get(keyId);
+    if (!list) return;
+    const filtered = list.filter((item) => item.timestamp >= cutoff);
+    if (filtered.length === 0) {
+      this.records.delete(keyId);
+    } else {
+      this.records.set(keyId, filtered);
+    }
+  }
+
+  getRecentUsage(keyId, now = Date.now()) {
+    this.prune(keyId, now);
+    const list = this.records.get(keyId) || [];
+    return list.reduce((sum, item) => sum + item.tokens, 0);
+  }
+
+  isNearLimit(keyId, { limitTpm = this.limitTpm, thresholdRatio = this.thresholdRatio, now = Date.now() } = {}) {
+    const usage = this.getRecentUsage(keyId, now);
+    return usage >= limitTpm * thresholdRatio;
+  }
+
+  clear() {
+    this.records.clear();
+  }
+}
+
+function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now = Date.now(), tpmTracker } = {}) {
   const rows = database.listEnabledUpstreamKeys();
   if (!rows.length) {
     const error = new Error('No upstream Gemini API key is configured');
@@ -49,12 +93,25 @@ function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now =
   const healthy = available.filter((row) => !row.cooldown_until || Number(row.cooldown_until) <= now);
   const pool = healthy.length ? healthy : available;
 
-  if (preferId) {
-    const preferred = pool.find((row) => row.id === preferId);
-    if (preferred) return decryptKeyRow(preferred, masterKey);
+  let candidatePool = pool;
+  if (tpmTracker && typeof tpmTracker.isNearLimit === 'function') {
+    const tpmSafe = pool.filter((row) => !tpmTracker.isNearLimit(row.id, { now }));
+    if (tpmSafe.length > 0) {
+      candidatePool = tpmSafe;
+    }
   }
 
-  return decryptKeyRow(pool[0], masterKey);
+  if (preferId) {
+    const preferred = candidatePool.find((row) => row.id === preferId);
+    if (preferred) return decryptKeyRow(preferred, masterKey);
+    // If preferred is healthy but was filtered by TPM, fallback to preferred if in pool
+    if (candidatePool !== pool) {
+      const preferredInPool = pool.find((row) => row.id === preferId);
+      if (preferredInPool) return decryptKeyRow(preferredInPool, masterKey);
+    }
+  }
+
+  return decryptKeyRow(candidatePool[0], masterKey);
 }
 
 module.exports = {
@@ -62,5 +119,6 @@ module.exports = {
   RATE_LIMIT_COOLDOWN_MS,
   isRateLimitError,
   pickUpstreamKey,
-  decryptKeyRow
+  decryptKeyRow,
+  TpmTracker
 };

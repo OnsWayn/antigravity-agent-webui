@@ -6,6 +6,12 @@ const { listGatewayModels } = require('./models');
 const { publicUpstreamKey } = require('./routes');
 
 function publicToken(row) {
+  let allowedModels = null;
+  if (row.allowed_models) {
+    try {
+      allowedModels = typeof row.allowed_models === 'string' ? JSON.parse(row.allowed_models) : row.allowed_models;
+    } catch {}
+  }
   return {
     id: row.id,
     name: row.name,
@@ -15,6 +21,11 @@ function publicToken(row) {
     rpm: row.rpm,
     enabled: Boolean(row.enabled),
     expiresAt: row.expires_at,
+    allowedModels,
+    defaultModel: row.default_model || null,
+    toolCodeExecution: row.tool_code_execution !== 0,
+    toolGoogleSearch: row.tool_google_search !== 0,
+    toolUrlContext: row.tool_url_context !== 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -123,7 +134,12 @@ function createAdminRouter(options = {}) {
       tokenPrefix: generated.tokenPrefix,
       quotaTokens: req.body?.quotaTokens,
       rpm: req.body?.rpm,
-      expiresAt: req.body?.expiresAt
+      expiresAt: req.body?.expiresAt,
+      allowedModels: req.body?.allowedModels,
+      defaultModel: req.body?.defaultModel,
+      toolCodeExecution: req.body?.toolCodeExecution !== undefined ? (req.body.toolCodeExecution ? 1 : 0) : 1,
+      toolGoogleSearch: req.body?.toolGoogleSearch !== undefined ? (req.body.toolGoogleSearch ? 1 : 0) : 1,
+      toolUrlContext: req.body?.toolUrlContext !== undefined ? (req.body.toolUrlContext ? 1 : 0) : 1
     });
     sendJson(res, 201, {
       success: true,
@@ -138,7 +154,12 @@ function createAdminRouter(options = {}) {
       quotaTokens: req.body?.quotaTokens,
       rpm: req.body?.rpm,
       enabled: req.body?.enabled,
-      expiresAt: req.body?.expiresAt
+      expiresAt: req.body?.expiresAt,
+      allowedModels: req.body?.allowedModels,
+      defaultModel: req.body?.defaultModel,
+      toolCodeExecution: req.body?.toolCodeExecution !== undefined ? (req.body.toolCodeExecution ? 1 : 0) : undefined,
+      toolGoogleSearch: req.body?.toolGoogleSearch !== undefined ? (req.body.toolGoogleSearch ? 1 : 0) : undefined,
+      toolUrlContext: req.body?.toolUrlContext !== undefined ? (req.body.toolUrlContext ? 1 : 0) : undefined
     });
     if (!row) return sendJson(res, 404, { success: false, error: { code: 'not_found', message: 'Token not found' } });
     sendJson(res, 200, { success: true, token: publicToken(row) });
@@ -158,6 +179,33 @@ function createAdminRouter(options = {}) {
       limit: Number(req.query.limit || 100)
     });
     sendJson(res, 200, { success: true, logs });
+  });
+
+  router.get('/logs', (req, res) => {
+    const result = database.listGatewayRequestLogs({
+      limit: req.query.limit,
+      offset: req.query.offset,
+      status: req.query.status,
+      tokenId: req.query.tokenId,
+      conversationKey: req.query.conversationKey,
+      startTime: req.query.startTime,
+      endTime: req.query.endTime,
+      search: req.query.search
+    });
+    sendJson(res, 200, { success: true, ...result });
+  });
+
+  router.get('/logs/:requestId', (req, res) => {
+    const log = database.getGatewayRequestLog(req.params.requestId);
+    if (!log) {
+      return sendJson(res, 404, { success: false, error: { code: 'not_found', message: 'Log not found' } });
+    }
+    sendJson(res, 200, { success: true, log });
+  });
+
+  router.delete('/logs', (req, res) => {
+    const count = database.clearGatewayRequestLogs();
+    sendJson(res, 200, { success: true, cleared: count });
   });
 
   return router;

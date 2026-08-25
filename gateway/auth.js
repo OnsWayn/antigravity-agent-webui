@@ -51,7 +51,8 @@ function authenticateAdmin(req, adminToken) {
   if (!adminToken) {
     return { ok: false, status: 503, code: 'admin_not_configured', message: 'GATEWAY_ADMIN_TOKEN is not configured' };
   }
-  const provided = extractBearerToken(req) || String(req.headers['x-gateway-admin-token'] || '').trim();
+  const provided = extractBearerToken(req)
+    || String(req.headers['x-gateway-admin-token'] || req.headers['x-admin-token'] || '').trim();
   if (!provided || provided !== adminToken) {
     return { ok: false, status: 401, code: 'invalid_admin_token', message: 'Invalid admin token' };
   }

@@ -1,6 +1,6 @@
 {
   "name": "antigravity-agent-webui",
-  "version": "1.5.2",
+  "version": "1.7.0",
   "description": "Local Web UI and OpenAI/Gemini protocol gateway for Gemini Antigravity managed agents",
   "author": "OnsWayn",
   "license": "Apache-2.0",
@@ -18,7 +18,7 @@
     "dev": "concurrently -k -n api,web -c cyan,magenta \"node server.js\" \"vite\"",
     "build": "vite build",
     "test": "node --test",
-    "check": "node --check server.js && node --check database.js && node --check environment-files.js && node --check http-security.js && node --check snapshot-cache.js && node --check gateway/models.js && node --check gateway/crypto.js && node --check gateway/translate.js && node --check gateway/stream.js && node --check gateway/interactions.js && node --check gateway/auth.js && node --check gateway/errors.js && node --check gateway/upstream.js && node --check gateway/routes.js && node --check gateway/admin-routes.js",
+    "check": "node --check server.js && node --check database.js && node --check environment-files.js && node --check http-security.js && node --check snapshot-cache.js && node --check gateway/models.js && node --check gateway/crypto.js && node --check gateway/logger.js && node --check gateway/lock.js && node --check gateway/translate.js && node --check gateway/stream.js && node --check gateway/interactions.js && node --check gateway/auth.js && node --check gateway/errors.js && node --check gateway/upstream.js && node --check gateway/routes.js && node --check gateway/admin-routes.js",
     "verify": "npm run check && npm test && npm run build"
   },
   "engines": {

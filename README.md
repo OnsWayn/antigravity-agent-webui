@@ -6,7 +6,7 @@ A local Gemini Interactions API console for Google's hosted `antigravity-preview
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.5.1** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.7.0** · Node.js **22.5+** · License **Apache-2.0**
 
 ## Why this project exists
 
@@ -89,6 +89,7 @@ If the server was already running before a code update, restart Node.js and perf
 | `GATEWAY_ENABLED` | `true` | Set `false` to disable `/v1` and `/v1beta` protocol routes. |
 | `GATEWAY_MASTER_KEY` | empty | Required to encrypt upstream Gemini keys and enable the gateway. |
 | `GATEWAY_ADMIN_TOKEN` | empty | Bearer token for the gateway admin API and WebUI panel. |
+| `GATEWAY_ENFORCE_SESSION_HEADER` | `false` | When `true`, requires downstream requests to specify `x-session-id`, returning 400 if omitted. |
 
 A proxy can also be configured in the WebUI. Explicitly disabling it in the UI prevents the server from using proxy environment variables for that request.
 
@@ -164,7 +165,13 @@ Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open
 
 The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. Allowed `agent_config.model` values are `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and `gemini-3.5-flash-lite`.
 
-Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s a key cools down for 60 seconds, and the gateway migrates the full chat transcript onto another key with a **new** sandbox instead of dropping the conversation. Files from the old sandbox are not transferred.
+Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s a key cools down for 60 seconds, and the gateway seamlessly migrates the full conversation context (including pending tool results) onto another key with a **new** sandbox, preserving execution continuity without dropping context or creating orphan tool results.
+
+### Session Isolation & Concurrency Control
+
+- **Session Isolation**: Downstream clients (e.g. multi-user chat bots or separate windows) should pass `x-session-id` (e.g., `qq:private:{user_id}` or `qq:group:{group_id}`). Each session maintains an isolated context chain and sandbox environment, even when sharing the same downstream token.
+- **Mutex Concurrency Locks**: Concurrent requests for the same `x-session-id` are queued and executed sequentially to prevent state collisions. Excess requests return HTTP 429 `session_busy`.
+- **End-to-End Trace Logs**: Every request is assigned a unique `request_id`, with automatic redaction of API keys, tokens, large Base64 images, and system instructions.
 
 > **Note:** The model list above is hardcoded in `gateway/models.js` and `web/src/lib.js`. Google does not currently provide an API to query which `agent_config.model` values a managed agent supports — the standard `/v1beta/models` endpoint only returns standalone Gemini models, not agent-internal engine options. If Google adds or removes supported models in the future, these two files must be updated manually.
 

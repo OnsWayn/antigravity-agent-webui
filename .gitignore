@@ -1,13 +1,48 @@
+# Dependencies
 node_modules/
+.pnpm-store/
+
+# Environment and secrets
 .env
 .env.*
 !.env.example
+
+# Local persistence & caches
 data/*.db
 data/*.db.*
 data/*.db-shm
 data/*.db-wal
 data/snapshot-cache/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
 .server-test.*.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+ehthumbs.db
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Temporary / Scratch files
+*.tmp
+*.bak
+

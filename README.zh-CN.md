@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.5.1** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.7.0** · Node.js **22.5+** · License **Apache-2.0**
 
 ## 这个项目解决什么问题
 
@@ -89,6 +89,7 @@ npm run dev
 | `GATEWAY_ENABLED` | `true` | 设为 `false` 时关闭 `/v1` 和 `/v1beta` 协议路由。 |
 | `GATEWAY_MASTER_KEY` | 空 | 加密上游 Gemini Key 并启用中转站，必填。 |
 | `GATEWAY_ADMIN_TOKEN` | 空 | 中转站管理 API / WebUI 面板的 Bearer Token。 |
+| `GATEWAY_ENFORCE_SESSION_HEADER` | `false` | 设为 `true` 时强制要求客户端提供 `x-session-id`，缺失时返回 400，防止多对话串台。 |
 
 WebUI 左侧也可以配置代理。界面中明确关闭代理后，服务端不会使用环境变量中的代理。
 
@@ -163,7 +164,13 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。允许的 `agent_config.model`：`gemini-3.7-flash`、`gemini-3.6-flash`、`gemini-3.5-flash`、`gemini-3.5-flash-lite`。
 
-可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 后冷却 60 秒，并把当前对话全文带到下一把 Key 上开**新沙盒**继续，不会丢上下文（旧沙盒里的文件带不过去）。
+可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 后冷却 60 秒，并把当前对话全文（包括正在进行的工具调用结果）带到下一把 Key 上开**新沙盒**继续，通过任务恢复上下文无缝继续任务，不会丢失上下文或抛出孤立工具结果（旧沙盒里的文件带不过去）。
+
+### 多会话隔离与并发控制
+
+- **会话隔离**：客户端（如 QQ 机器人、多窗口聊天客户端）应在请求头中传入 `x-session-id`（例如 `qq:private:{user_id}` 或 `qq:group:{group_id}`）。每个会话拥有完全独立的上下文链与远程沙盒环境，共用同一把 API Key 也绝不会发生串台。
+- **并发互斥锁**：同一 `x-session-id` 的并发请求会在服务端自动排队串行处理，防止旧请求覆盖新交互状态；超出排队上限时返回 HTTP 429 `session_busy`。
+- **全链路诊断日志**：每个请求分配唯一 `request_id`，自动脱敏 API Key、Authorization 头、超大图片 Base64 与系统指令。
 
 > **注意**：上述模型列表是在代码中硬编码的（`gateway/models.js` 和 `web/src/lib.js`）。Google 目前没有提供 API 来查询某个 managed agent 支持哪些 `agent_config.model` 值——标准的 `/v1beta/models` 接口只返回独立 Gemini 模型目录，不包含 Agent 内部引擎信息。如果 Google 将来新增或下线模型，需要手动更新这两个文件。
 
