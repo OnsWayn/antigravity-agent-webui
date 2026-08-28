@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { decryptSecret } = require('./crypto');
 const { resolveEnvProxyUrl } = require('./interactions');
 
@@ -28,43 +29,37 @@ function decryptKeyRow(row, masterKey) {
   };
 }
 
-class TpmTracker {
-  constructor({ windowMs = 60000, limitTpm = 100000, thresholdRatio = 0.8 } = {}) {
+class RequestCounter {
+  constructor({ windowMs = 60000 } = {}) {
     this.windowMs = windowMs;
-    this.limitTpm = limitTpm;
-    this.thresholdRatio = thresholdRatio;
     this.records = new Map();
   }
 
-  record(keyId, tokens, timestamp = Date.now()) {
-    if (!keyId || !Number.isFinite(tokens) || tokens <= 0) return;
+  configure({ windowMs } = {}) {
+    if (Number.isFinite(Number(windowMs)) && Number(windowMs) > 0) this.windowMs = Number(windowMs);
+    return this;
+  }
+
+  recordRequest(keyId, ts = Date.now()) {
+    if (!keyId) return;
     const list = this.records.get(keyId) || [];
-    list.push({ tokens: Number(tokens), timestamp: Number(timestamp) });
+    list.push(Number(ts));
     this.records.set(keyId, list);
-    this.prune(keyId, timestamp);
+    this.prune(keyId, ts);
   }
 
   prune(keyId, now = Date.now()) {
     const cutoff = now - this.windowMs;
     const list = this.records.get(keyId);
     if (!list) return;
-    const filtered = list.filter((item) => item.timestamp >= cutoff);
-    if (filtered.length === 0) {
-      this.records.delete(keyId);
-    } else {
-      this.records.set(keyId, filtered);
-    }
+    const filtered = list.filter((timestamp) => timestamp >= cutoff);
+    if (filtered.length === 0) this.records.delete(keyId);
+    else this.records.set(keyId, filtered);
   }
 
-  getRecentUsage(keyId, now = Date.now()) {
+  getRpm(keyId, now = Date.now()) {
     this.prune(keyId, now);
-    const list = this.records.get(keyId) || [];
-    return list.reduce((sum, item) => sum + item.tokens, 0);
-  }
-
-  isNearLimit(keyId, { limitTpm = this.limitTpm, thresholdRatio = this.thresholdRatio, now = Date.now() } = {}) {
-    const usage = this.getRecentUsage(keyId, now);
-    return usage >= limitTpm * thresholdRatio;
+    return (this.records.get(keyId) || []).length;
   }
 
   clear() {
@@ -72,7 +67,164 @@ class TpmTracker {
   }
 }
 
-function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now = Date.now(), tpmTracker } = {}) {
+class TpmTracker {
+  constructor({
+    windowMs = 60000,
+    limitTpm = 100000,
+    thresholdRatio = 0.8,
+    reserveTtlMs,
+    onReserveExpired
+  } = {}) {
+    this.windowMs = windowMs;
+    this.limitTpm = limitTpm;
+    this.thresholdRatio = thresholdRatio;
+    this.reserveTtlMs = Number.isFinite(Number(reserveTtlMs)) && Number(reserveTtlMs) >= 1000
+      ? Number(reserveTtlMs)
+      : windowMs;
+    this.onReserveExpired = typeof onReserveExpired === 'function' ? onReserveExpired : null;
+    this.records = new Map();
+  }
+
+  configure({ windowMs, limitTpm, thresholdRatio, reserveTtlMs } = {}) {
+    if (Number.isFinite(Number(windowMs)) && Number(windowMs) > 0) this.windowMs = Number(windowMs);
+    if (Number.isFinite(Number(limitTpm)) && Number(limitTpm) > 0) this.limitTpm = Number(limitTpm);
+    if (Number.isFinite(Number(thresholdRatio)) && Number(thresholdRatio) > 0) this.thresholdRatio = Number(thresholdRatio);
+    if (Number.isFinite(Number(reserveTtlMs)) && Number(reserveTtlMs) >= 1000) this.reserveTtlMs = Number(reserveTtlMs);
+    else if (reserveTtlMs === null) this.reserveTtlMs = this.windowMs;
+    return this;
+  }
+
+  record(keyId, tokens, timestamp = Date.now()) {
+    if (!keyId || !Number.isFinite(tokens) || tokens <= 0) return;
+    this.prune(keyId, timestamp);
+    const list = this.records.get(keyId) || [];
+    list.push({ tokens: Number(tokens), timestamp: Number(timestamp) });
+    this.records.set(keyId, list);
+  }
+
+  prune(keyId, now = Date.now()) {
+    const cutoff = now - this.windowMs;
+    const list = this.records.get(keyId);
+    if (!list) return;
+    const filtered = [];
+    for (const item of list) {
+      if (item.kind === 'reserve') {
+        if (Number(item.expiresAt) <= now || item.timestamp < cutoff) {
+          if (this.onReserveExpired && Number(item.expiresAt) <= now) {
+            this.onReserveExpired({
+              keyId,
+              reserveId: item.reserveId,
+              needed: item.tokens,
+              ageMs: now - item.timestamp
+            });
+          }
+          continue;
+        }
+      } else if (item.timestamp < cutoff) {
+        continue;
+      }
+      filtered.push(item);
+    }
+    if (filtered.length === 0) this.records.delete(keyId);
+    else this.records.set(keyId, filtered);
+  }
+
+  getRecentUsage(keyId, now = Date.now()) {
+    this.prune(keyId, now);
+    const list = this.records.get(keyId) || [];
+    return list.reduce((sum, item) => sum + Number(item.tokens || 0), 0);
+  }
+
+  isNearLimit(keyId, {
+    limitTpm = this.limitTpm,
+    thresholdRatio = this.thresholdRatio,
+    now = Date.now()
+  } = {}) {
+    const usage = this.getRecentUsage(keyId, now);
+    return usage >= limitTpm * thresholdRatio;
+  }
+
+  timeUntilFits(keyId, needed, { limitTpm = this.limitTpm, now = Date.now() } = {}) {
+    this.prune(keyId, now);
+    const need = Number(needed) || 0;
+    const limit = Number(limitTpm) || this.limitTpm;
+    if (!(need > 0)) return 0;
+    if (need > limit) return Infinity;
+    const list = [...(this.records.get(keyId) || [])].sort((a, b) => a.timestamp - b.timestamp);
+    let usage = list.reduce((sum, item) => sum + Number(item.tokens || 0), 0);
+    if (usage + need < limit) return 0;
+    for (const item of list) {
+      usage -= Number(item.tokens || 0);
+      if (usage + need < limit) {
+        return Math.max(0, item.timestamp + this.windowMs - now);
+      }
+    }
+    return Infinity;
+  }
+
+  tryReserve(keyId, needed, { limitTpm = this.limitTpm, now = Date.now(), ttlMs } = {}) {
+    if (!keyId) return null;
+    this.prune(keyId, now);
+    const need = Number(needed) || 0;
+    const limit = Number(limitTpm) || this.limitTpm;
+    if (need > limit) return null;
+    const usage = this.getRecentUsage(keyId, now);
+    if (usage + need >= limit && need > 0) return null;
+    const ttl = Number.isFinite(Number(ttlMs)) && Number(ttlMs) >= 1000 ? Number(ttlMs) : this.reserveTtlMs;
+    const reserveId = crypto.randomUUID();
+    const list = this.records.get(keyId) || [];
+    list.push({
+      reserveId,
+      keyId,
+      tokens: Math.max(0, need),
+      timestamp: Number(now),
+      expiresAt: Number(now) + ttl,
+      kind: 'reserve'
+    });
+    this.records.set(keyId, list);
+    return reserveId;
+  }
+
+  commitReservation(reserveId, actualTokens, timestamp = Date.now()) {
+    if (!reserveId) return false;
+    for (const [keyId, list] of this.records.entries()) {
+      const index = list.findIndex((item) => item.kind === 'reserve' && item.reserveId === reserveId);
+      if (index < 0) continue;
+      list.splice(index, 1);
+      if (list.length === 0) this.records.delete(keyId);
+      else this.records.set(keyId, list);
+      this.record(keyId, actualTokens, timestamp);
+      return true;
+    }
+    return false;
+  }
+
+  cancelReservation(reserveId) {
+    if (!reserveId) return false;
+    for (const [keyId, list] of this.records.entries()) {
+      const next = list.filter((item) => !(item.kind === 'reserve' && item.reserveId === reserveId));
+      if (next.length === list.length) continue;
+      if (next.length === 0) this.records.delete(keyId);
+      else this.records.set(keyId, next);
+      return true;
+    }
+    return false;
+  }
+
+  clear() {
+    this.records.clear();
+  }
+}
+
+function pickUpstreamKey(database, masterKey, {
+  preferId,
+  excludeIds = [],
+  now = Date.now(),
+  tpmTracker,
+  strategy = 'frok',
+  tpmPaceLimit,
+  needed = 0
+} = {}) {
   const rows = database.listEnabledUpstreamKeys();
   if (!rows.length) {
     const error = new Error('No upstream Gemini API key is configured');
@@ -92,6 +244,31 @@ function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now =
 
   const healthy = available.filter((row) => !row.cooldown_until || Number(row.cooldown_until) <= now);
   const pool = healthy.length ? healthy : available;
+  const pace = strategy === 'pace';
+
+  if (pace) {
+    if (preferId) {
+      const preferredHealthy = pool.find((row) => row.id === preferId);
+      if (preferredHealthy) {
+        return { ...decryptKeyRow(preferredHealthy, masterKey), tpmAvoided: false };
+      }
+    }
+
+    let candidatePool = pool;
+    if (tpmTracker && typeof tpmTracker.getRecentUsage === 'function') {
+      const limit = Number(tpmPaceLimit) > 0 ? Number(tpmPaceLimit) : tpmTracker.limitTpm;
+      const need = Number(needed) > 0 ? Number(needed) : 0;
+      const tpmSafe = pool.filter((row) => tpmTracker.getRecentUsage(row.id, now) + need < limit);
+      if (tpmSafe.length > 0) {
+        candidatePool = tpmSafe;
+      } else {
+        candidatePool = [...pool].sort(
+          (a, b) => tpmTracker.getRecentUsage(a.id, now) - tpmTracker.getRecentUsage(b.id, now)
+        );
+      }
+    }
+    return { ...decryptKeyRow(candidatePool[0], masterKey), tpmAvoided: false };
+  }
 
   let candidatePool = pool;
   if (tpmTracker && typeof tpmTracker.isNearLimit === 'function') {
@@ -102,16 +279,20 @@ function pickUpstreamKey(database, masterKey, { preferId, excludeIds = [], now =
   }
 
   if (preferId) {
-    const preferred = candidatePool.find((row) => row.id === preferId);
-    if (preferred) return decryptKeyRow(preferred, masterKey);
-    // If preferred is healthy but was filtered by TPM, fallback to preferred if in pool
-    if (candidatePool !== pool) {
-      const preferredInPool = pool.find((row) => row.id === preferId);
-      if (preferredInPool) return decryptKeyRow(preferredInPool, masterKey);
+    const preferredSafe = candidatePool.find((row) => row.id === preferId);
+    if (preferredSafe) {
+      return { ...decryptKeyRow(preferredSafe, masterKey), tpmAvoided: false };
+    }
+    if (candidatePool.length > 0 && candidatePool !== pool) {
+      return { ...decryptKeyRow(candidatePool[0], masterKey), tpmAvoided: true };
+    }
+    const preferredInPool = pool.find((row) => row.id === preferId);
+    if (preferredInPool) {
+      return { ...decryptKeyRow(preferredInPool, masterKey), tpmAvoided: false };
     }
   }
 
-  return decryptKeyRow(candidatePool[0], masterKey);
+  return { ...decryptKeyRow(candidatePool[0], masterKey), tpmAvoided: false };
 }
 
 module.exports = {
@@ -120,5 +301,6 @@ module.exports = {
   isRateLimitError,
   pickUpstreamKey,
   decryptKeyRow,
-  TpmTracker
+  TpmTracker,
+  RequestCounter
 };

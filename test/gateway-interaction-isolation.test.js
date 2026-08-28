@@ -73,6 +73,7 @@ function withTestGateway(options = {}, callback) {
     masterKey,
     enabled: true,
     enforceSessionHeader: options.enforceSessionHeader || false,
+    sessionLockTimeoutMs: options.sessionLockTimeoutMs,
     sessionQueueLimit: options.sessionQueueLimit || 3,
     callUpstream
   }));
@@ -249,6 +250,165 @@ test('Session Lock: Reject when queue limit exceeded', async () => {
   const release2 = await p2;
   assert.equal(queued, true);
   release2();
+});
+
+test('Session Lock: timeout does not steal holder; non-owner release is ignored', async () => {
+  const events = [];
+  const lock = createSessionLockManager({
+    defaultTimeoutMs: 40,
+    defaultQueueLimit: 3,
+    onLockEvent: (_level, event) => events.push(event)
+  });
+
+  const release1 = await lock.acquireLock('sess', { requestId: 'req1', timeoutMs: 40 });
+  assert.equal(lock.getActiveLocks(), 1);
+
+  lock.releaseLock('sess', 'not-owner');
+  assert.equal(lock.getActiveLocks(), 1);
+  assert.ok(events.includes('session_lock_release_ignored'));
+
+  let waiterErr = null;
+  await lock.acquireLock('sess', { requestId: 'req2', timeoutMs: 40 }).catch((err) => {
+    waiterErr = err;
+  });
+  assert.equal(waiterErr?.code, 'session_busy');
+  assert.equal(waiterErr?.status, 429);
+  assert.equal(lock.getActiveLocks(), 1);
+  assert.ok(events.includes('session_lock_wait_timeout'));
+
+  release1();
+  assert.equal(lock.getActiveLocks(), 0);
+});
+
+async function seedGatewayClient(database, masterKey, tokenName = 'client') {
+  const encrypted = encryptSecret('gemini-key', masterKey);
+  database.insertUpstreamKey({
+    name: 'key1',
+    ciphertext: encrypted.ciphertext,
+    iv: encrypted.iv,
+    tag: encrypted.tag,
+    suffix: keySuffix('gemini-key')
+  });
+  const client = generateClientToken();
+  database.insertClientToken({
+    name: tokenName,
+    tokenHash: client.tokenHash,
+    tokenPrefix: client.tokenPrefix,
+    quotaTokens: -1
+  });
+  return client;
+}
+
+test('Session Lock: long upstream cannot run a second continue in parallel', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  await withTestGateway({
+    sessionLockTimeoutMs: 40,
+    callUpstream: async ({ payload }) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 120));
+      inFlight -= 1;
+      return {
+        id: 'int-slow',
+        environment_id: 'env-1',
+        status: 'completed',
+        output_text: `done:${payload.input}`
+      };
+    }
+  }, async ({ base, database, masterKey }) => {
+    const client = await seedGatewayClient(database, masterKey);
+    const headers = {
+      Authorization: `Bearer ${client.token}`,
+      'x-session-id': 'qq:group:lock-timeout'
+    };
+    const body = {
+      model: 'gemini-3.5-flash-lite',
+      messages: [{ role: 'user', content: 'same-turn' }]
+    };
+    const p1 = request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    await new Promise((r) => setTimeout(r, 50));
+    const p2 = request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    const [res1, res2] = await Promise.all([p1, p2]);
+    assert.equal(maxInFlight, 1);
+    assert.equal(res1.status, 200);
+    assert.equal(res2.status, 429);
+    assert.equal(res2.json?.error?.code, 'session_busy');
+  });
+});
+
+test('Duplicate turn replay: identical messages do not call upstream twice', async () => {
+  let calls = 0;
+  await withTestGateway({
+    callUpstream: async () => {
+      calls += 1;
+      return {
+        id: `int-${calls}`,
+        environment_id: 'env-1',
+        status: 'completed',
+        output_text: 'first-reply'
+      };
+    }
+  }, async ({ base, database, masterKey }) => {
+    const client = await seedGatewayClient(database, masterKey, 'dup-client');
+    const headers = {
+      Authorization: `Bearer ${client.token}`,
+      'x-session-id': 'qq:private:dup'
+    };
+    const body = {
+      model: 'gemini-3.5-flash-lite',
+      messages: [{ role: 'user', content: 'Hello json' }]
+    };
+    const first = await request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    assert.equal(first.status, 200);
+    assert.equal(first.json.choices[0].message.content, 'first-reply');
+
+    const second = await request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    assert.equal(second.status, 200);
+    assert.equal(second.json.choices[0].message.content, 'first-reply');
+    assert.equal(calls, 1);
+  });
+});
+
+test('Duplicate turn: queued retry after first completes replays without a second upstream call', async () => {
+  let calls = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  await withTestGateway({
+    sessionLockTimeoutMs: 500,
+    callUpstream: async () => {
+      calls += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 60));
+      inFlight -= 1;
+      return {
+        id: 'int-1',
+        environment_id: 'env-1',
+        status: 'completed',
+        output_text: 'only-once'
+      };
+    }
+  }, async ({ base, database, masterKey }) => {
+    const client = await seedGatewayClient(database, masterKey, 'queued-dup');
+    const headers = {
+      Authorization: `Bearer ${client.token}`,
+      'x-session-id': 'qq:private:queued-dup'
+    };
+    const body = {
+      model: 'gemini-3.5-flash-lite',
+      messages: [{ role: 'user', content: 'retry-me' }]
+    };
+    const p1 = request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    const p2 = request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    const [res1, res2] = await Promise.all([p1, p2]);
+    assert.equal(maxInFlight, 1);
+    assert.equal(calls, 1);
+    assert.equal(res1.status, 200);
+    assert.equal(res2.status, 200);
+    assert.equal(res1.json.choices[0].message.content, 'only-once');
+    assert.equal(res2.json.choices[0].message.content, 'only-once');
+  });
 });
 
 test('Key Rotation Migration: Preserves function_result structure and tool context', () => {

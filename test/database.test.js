@@ -361,3 +361,97 @@ test('Schema V5: client_tokens fine control columns and updates', () => {
     assert.deepEqual(JSON.parse(updated.allowed_models), ['gemini-3.7-flash']);
   });
 });
+
+test('Schema V6: settings, parent fields and CAS conversation updates', () => {
+  withDatabase((database) => {
+    database.setGatewaySettings({
+      tpmLimit: 5000,
+      tpmThresholdRatio: 0.5,
+      tpmStrategy: 'pace',
+      tpmPaceLimit: 90000,
+      tpmReserveTtlMs: 15000
+    });
+    const stored = database.getGatewaySettingsMap();
+    assert.equal(stored.tpmLimit, 5000);
+    assert.equal(stored.tpmThresholdRatio, 0.5);
+    assert.equal(stored.tpmStrategy, 'pace');
+    assert.equal(stored.tpmPaceLimit, 90000);
+    assert.equal(stored.tpmReserveTtlMs, 15000);
+
+    database.upsertGatewayConversation({
+      tokenId: 'tk-1',
+      conversationKey: 'hdr:main',
+      interactionId: 'int-1',
+      environmentId: 'env-1',
+      prefixHash: 'hash-1',
+      upstreamKeyId: 'uk-1',
+      transcript: [{ role: 'user', text: 'hi' }]
+    });
+    const casFail = database.upsertGatewayConversation({
+      tokenId: 'tk-1',
+      conversationKey: 'hdr:main',
+      interactionId: 'int-2',
+      environmentId: 'env-2',
+      prefixHash: 'hash-2',
+      upstreamKeyId: 'uk-2',
+      expectedInteractionId: 'int-stale',
+      expectedUpstreamKeyId: 'uk-1',
+      expectedEnvironmentId: 'env-1'
+    });
+    assert.equal(casFail.conflict, true);
+    const trunk = database.getGatewayConversation('tk-1', 'hdr:main');
+    assert.equal(trunk.interaction_id, 'int-1');
+
+    const casOk = database.upsertGatewayConversation({
+      tokenId: 'tk-1',
+      conversationKey: 'hdr:main',
+      interactionId: 'int-2',
+      environmentId: 'env-2',
+      prefixHash: 'hash-2',
+      upstreamKeyId: 'uk-2',
+      parentInteractionId: 'int-1',
+      expectedInteractionId: 'int-1',
+      expectedUpstreamKeyId: 'uk-1',
+      expectedEnvironmentId: 'env-1'
+    });
+    assert.equal(casOk.ok, true);
+    const updated = database.getGatewayConversation('tk-1', 'hdr:main');
+    assert.equal(updated.interaction_id, 'int-2');
+    assert.equal(updated.parent_interaction_id, 'int-1');
+
+    database.upsertGatewayConversation({
+      tokenId: 'tk-1',
+      conversationKey: 'hdr:main:fork:req:abcd',
+      interactionId: 'int-fork',
+      environmentId: 'env-fork',
+      prefixHash: 'hash-fork',
+      upstreamKeyId: 'uk-1',
+      parentConversationKey: 'hdr:main'
+    });
+    const rows = database.listGatewayConversationsForSource('tk-1', 'hdr:main');
+    assert.equal(rows.length, 2);
+    assert.equal(database.getGatewayConversation('tk-1', 'hdr:main').interaction_id, 'int-2');
+  });
+});
+
+test('incrementUpstreamKeyRequest accumulates within a Pacific day and resets across midnight', () => {
+  withDatabase((database) => {
+    const key = database.insertUpstreamKey({
+      name: 'rpd',
+      ciphertext: 'cipher',
+      iv: 'iv',
+      tag: 'tag',
+      suffix: 'rpd1'
+    });
+    const sameDayA = Date.parse('2026-08-28T06:30:00Z'); // 2026-08-27 PDT
+    const sameDayB = Date.parse('2026-08-28T06:59:00Z');
+    const nextDay = Date.parse('2026-08-28T07:00:00Z'); // 2026-08-28 PDT
+    database.incrementUpstreamKeyRequest(key.id, sameDayA);
+    const afterTwo = database.incrementUpstreamKeyRequest(key.id, sameDayB);
+    assert.equal(afterTwo.rpd_pacific_day, '2026-08-27');
+    assert.equal(afterTwo.rpd_count, 2);
+    const afterRollover = database.incrementUpstreamKeyRequest(key.id, nextDay);
+    assert.equal(afterRollover.rpd_pacific_day, '2026-08-28');
+    assert.equal(afterRollover.rpd_count, 1);
+  });
+});

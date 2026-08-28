@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { pacificDayKey } = require('./gateway/pacific-time');
 
 function parseJson(value, fallback) {
   if (!value) return fallback;
@@ -248,10 +249,14 @@ class AppDatabase {
       this.createSchemaV3();
       this.createSchemaV4();
       this.createSchemaV5();
+      this.createSchemaV6();
+      this.createSchemaV7();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
       return;
     }
 
@@ -272,6 +277,14 @@ class AppDatabase {
     this.createSchemaV5();
     if (version < 5) {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(Date.now());
+    }
+    this.createSchemaV6();
+    if (version < 6) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, ?)').run(Date.now());
+    }
+    this.createSchemaV7();
+    if (version < 7) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
     }
   }
 
@@ -318,6 +331,17 @@ class AppDatabase {
         error_code TEXT,
         key_switch_count INTEGER DEFAULT 0,
         retry_count INTEGER DEFAULT 0,
+        upstream_transition TEXT,
+        context_rebuild_reason TEXT,
+        fork_reason TEXT,
+        source_conversation_key TEXT,
+        target_conversation_key TEXT,
+        source_upstream_key_id TEXT,
+        upstream_previous_interaction_id TEXT,
+        raw_call_marker_detected INTEGER NOT NULL DEFAULT 0,
+        raw_call_marker_count INTEGER NOT NULL DEFAULT 0,
+        tool_trace_status TEXT,
+        diagnostics_json TEXT,
         created_at INTEGER NOT NULL
       );
 
@@ -338,6 +362,41 @@ class AppDatabase {
       this.ensureColumn('client_tokens', 'tool_google_search', 'INTEGER NOT NULL DEFAULT 1');
       this.ensureColumn('client_tokens', 'tool_url_context', 'INTEGER NOT NULL DEFAULT 1');
     }
+  }
+
+  createSchemaV6() {
+    if (this.tableExists('gateway_conversations')) {
+      this.ensureColumn('gateway_conversations', 'parent_conversation_key', 'TEXT');
+      this.ensureColumn('gateway_conversations', 'parent_interaction_id', 'TEXT');
+      this.ensureColumn('gateway_conversations', 'parent_environment_id', 'TEXT');
+      this.ensureColumn('gateway_conversations', 'parent_upstream_key_id', 'TEXT');
+    }
+    if (this.tableExists('gateway_request_logs')) {
+      this.ensureColumn('gateway_request_logs', 'upstream_transition', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'context_rebuild_reason', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'fork_reason', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'source_conversation_key', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'target_conversation_key', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'source_upstream_key_id', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'upstream_previous_interaction_id', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'raw_call_marker_detected', 'INTEGER NOT NULL DEFAULT 0');
+      this.ensureColumn('gateway_request_logs', 'raw_call_marker_count', 'INTEGER NOT NULL DEFAULT 0');
+      this.ensureColumn('gateway_request_logs', 'tool_trace_status', 'TEXT');
+      this.ensureColumn('gateway_request_logs', 'diagnostics_json', 'TEXT');
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS gateway_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  }
+
+  createSchemaV7() {
+    if (!this.tableExists('upstream_keys')) return;
+    this.ensureColumn('upstream_keys', 'rpd_pacific_day', 'TEXT');
+    this.ensureColumn('upstream_keys', 'rpd_count', 'INTEGER NOT NULL DEFAULT 0');
   }
 
   createSchemaV4() {
@@ -760,6 +819,34 @@ class AppDatabase {
     return this.db.prepare('DELETE FROM upstream_keys WHERE id = ?').run(id).changes > 0;
   }
 
+  incrementUpstreamKeyRequest(id, ts = Date.now()) {
+    const existing = this.getUpstreamKey(id);
+    if (!existing) return null;
+    const day = pacificDayKey(ts);
+    const now = Number(ts);
+    if (existing.rpd_pacific_day !== day) {
+      this.db.prepare(`
+        UPDATE upstream_keys SET rpd_pacific_day = ?, rpd_count = 1, updated_at = ? WHERE id = ?
+      `).run(day, now, id);
+    } else {
+      this.db.prepare(`
+        UPDATE upstream_keys SET rpd_count = rpd_count + 1, updated_at = ? WHERE id = ?
+      `).run(now, id);
+    }
+    return this.getUpstreamKey(id);
+  }
+
+  getLatestSuccessTotalTokens(conversationKey) {
+    if (!conversationKey || !this.tableExists('gateway_request_logs')) return null;
+    const row = this.db.prepare(`
+      SELECT total_tokens FROM gateway_request_logs
+      WHERE conversation_key = ? AND status = 'success' AND total_tokens IS NOT NULL
+      ORDER BY created_at DESC LIMIT 1
+    `).get(conversationKey);
+    const n = Number(row?.total_tokens);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
   markUpstreamKeyUsed(id, { failed = false, rateLimited = false, cooldownMs = 60000 } = {}) {
     const now = Date.now();
     if (rateLimited) {
@@ -929,6 +1016,46 @@ class AppDatabase {
     `).get(tokenId, conversationKey) || null;
   }
 
+  listGatewayConversationsForSource(tokenId, sourceKey) {
+    if (!tokenId || !sourceKey) return [];
+    return this.db.prepare(`
+      SELECT * FROM gateway_conversations
+      WHERE token_id = ?
+        AND (conversation_key = ? OR conversation_key LIKE ?)
+      ORDER BY updated_at DESC
+    `).all(tokenId, sourceKey, `${sourceKey}:fork:%`);
+  }
+
+  getGatewaySettingsMap() {
+    if (!this.tableExists('gateway_settings')) return {};
+    const rows = this.db.prepare('SELECT key, value FROM gateway_settings').all();
+    const out = {};
+    for (const row of rows) {
+      try {
+        out[row.key] = JSON.parse(row.value);
+      } catch {
+        out[row.key] = row.value;
+      }
+    }
+    return out;
+  }
+
+  setGatewaySettings(values = {}) {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      INSERT INTO gateway_settings(key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = excluded.updated_at
+    `);
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) continue;
+      stmt.run(key, JSON.stringify(value), now);
+    }
+    return this.getGatewaySettingsMap();
+  }
+
   upsertGatewayConversation({
     tokenId,
     conversationKey,
@@ -937,15 +1064,71 @@ class AppDatabase {
     prefixHash,
     model,
     upstreamKeyId,
-    transcript
+    transcript,
+    parentConversationKey,
+    parentInteractionId,
+    parentEnvironmentId,
+    parentUpstreamKeyId,
+    expectedInteractionId,
+    expectedUpstreamKeyId,
+    expectedEnvironmentId
   }) {
-    if (!tokenId || !conversationKey) return;
+    if (!tokenId || !conversationKey) {
+      return { ok: false, conflict: false, skipped: true };
+    }
     const now = Date.now();
+    const transcriptJson = transcript == null ? null : json(transcript);
+
+    if (expectedInteractionId != null || expectedUpstreamKeyId != null || expectedEnvironmentId != null) {
+      const result = this.db.prepare(`
+        UPDATE gateway_conversations SET
+          interaction_id = ?,
+          environment_id = ?,
+          prefix_hash = ?,
+          model = COALESCE(?, model),
+          updated_at = ?,
+          upstream_key_id = ?,
+          transcript_json = COALESCE(?, transcript_json),
+          context_version = COALESCE(context_version, 0) + 1,
+          parent_conversation_key = COALESCE(?, parent_conversation_key),
+          parent_interaction_id = COALESCE(?, parent_interaction_id),
+          parent_environment_id = COALESCE(?, parent_environment_id),
+          parent_upstream_key_id = COALESCE(?, parent_upstream_key_id)
+        WHERE token_id = ?
+          AND conversation_key = ?
+          AND (interaction_id IS ? OR interaction_id = ?)
+          AND (upstream_key_id IS ? OR upstream_key_id = ?)
+          AND (environment_id IS ? OR environment_id = ?)
+      `).run(
+        interactionId || null,
+        environmentId || null,
+        prefixHash || null,
+        model || null,
+        now,
+        upstreamKeyId || null,
+        transcriptJson,
+        parentConversationKey || null,
+        parentInteractionId || null,
+        parentEnvironmentId || null,
+        parentUpstreamKeyId || null,
+        tokenId,
+        conversationKey,
+        expectedInteractionId ?? null,
+        expectedInteractionId ?? null,
+        expectedUpstreamKeyId ?? null,
+        expectedUpstreamKeyId ?? null,
+        expectedEnvironmentId ?? null,
+        expectedEnvironmentId ?? null
+      );
+      return { ok: result.changes === 1, conflict: result.changes !== 1, changes: result.changes };
+    }
+
     this.db.prepare(`
       INSERT INTO gateway_conversations (
         token_id, conversation_key, interaction_id, environment_id, prefix_hash, model,
-        updated_at, upstream_key_id, transcript_json, context_version, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        updated_at, upstream_key_id, transcript_json, context_version, created_at,
+        parent_conversation_key, parent_interaction_id, parent_environment_id, parent_upstream_key_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
       ON CONFLICT(token_id, conversation_key) DO UPDATE SET
         interaction_id = excluded.interaction_id,
         environment_id = excluded.environment_id,
@@ -955,7 +1138,11 @@ class AppDatabase {
         upstream_key_id = excluded.upstream_key_id,
         transcript_json = COALESCE(excluded.transcript_json, gateway_conversations.transcript_json),
         context_version = COALESCE(gateway_conversations.context_version, 0) + 1,
-        created_at = COALESCE(gateway_conversations.created_at, excluded.created_at)
+        created_at = COALESCE(gateway_conversations.created_at, excluded.created_at),
+        parent_conversation_key = COALESCE(excluded.parent_conversation_key, gateway_conversations.parent_conversation_key),
+        parent_interaction_id = COALESCE(excluded.parent_interaction_id, gateway_conversations.parent_interaction_id),
+        parent_environment_id = COALESCE(excluded.parent_environment_id, gateway_conversations.parent_environment_id),
+        parent_upstream_key_id = COALESCE(excluded.parent_upstream_key_id, gateway_conversations.parent_upstream_key_id)
     `).run(
       tokenId,
       conversationKey,
@@ -965,9 +1152,14 @@ class AppDatabase {
       model || null,
       now,
       upstreamKeyId || null,
-      transcript == null ? null : json(transcript),
-      now
+      transcriptJson,
+      now,
+      parentConversationKey || null,
+      parentInteractionId || null,
+      parentEnvironmentId || null,
+      parentUpstreamKeyId || null
     );
+    return { ok: true, conflict: false };
   }
 
   saveGatewayToolCall({ openaiCallId, googleCallId, name, tokenId, interactionId }) {
@@ -1001,7 +1193,12 @@ class AppDatabase {
         response_interaction_id, response_environment_id,
         model, backend_model, stream, prompt_tokens, completion_tokens,
         total_tokens, duration_ms, status, error_message, error_code,
-        key_switch_count, retry_count, created_at
+        key_switch_count, retry_count,
+        upstream_transition, context_rebuild_reason, fork_reason,
+        source_conversation_key, target_conversation_key, source_upstream_key_id,
+        upstream_previous_interaction_id, raw_call_marker_detected, raw_call_marker_count,
+        tool_trace_status, diagnostics_json,
+        created_at
       ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
@@ -1010,7 +1207,12 @@ class AppDatabase {
         ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?
       )
     `).run(
       entry.requestId,
@@ -1042,6 +1244,17 @@ class AppDatabase {
       entry.errorCode || null,
       Number(entry.keySwitchCount || 0),
       Number(entry.retryCount || 0),
+      entry.upstreamTransition || null,
+      entry.contextRebuildReason || null,
+      entry.forkReason || null,
+      entry.sourceConversationKey || null,
+      entry.targetConversationKey || null,
+      entry.sourceUpstreamKeyId || null,
+      entry.upstreamPreviousInteractionId !== undefined ? (entry.upstreamPreviousInteractionId || null) : null,
+      entry.rawCallMarkerDetected ? 1 : 0,
+      Number(entry.rawCallMarkerCount || 0),
+      entry.toolTraceStatus || null,
+      entry.diagnosticsJson == null ? null : (typeof entry.diagnosticsJson === 'string' ? entry.diagnosticsJson : json(entry.diagnosticsJson)),
       now
     );
     return this.getGatewayRequestLog(entry.requestId);
@@ -1083,7 +1296,18 @@ class AppDatabase {
       errorMessage: 'error_message',
       errorCode: 'error_code',
       keySwitchCount: 'key_switch_count',
-      retryCount: 'retry_count'
+      retryCount: 'retry_count',
+      upstreamTransition: 'upstream_transition',
+      contextRebuildReason: 'context_rebuild_reason',
+      forkReason: 'fork_reason',
+      sourceConversationKey: 'source_conversation_key',
+      targetConversationKey: 'target_conversation_key',
+      sourceUpstreamKeyId: 'source_upstream_key_id',
+      upstreamPreviousInteractionId: 'upstream_previous_interaction_id',
+      rawCallMarkerDetected: 'raw_call_marker_detected',
+      rawCallMarkerCount: 'raw_call_marker_count',
+      toolTraceStatus: 'tool_trace_status',
+      diagnosticsJson: 'diagnostics_json'
     };
 
     for (const [key, col] of Object.entries(fieldMap)) {
@@ -1092,7 +1316,7 @@ class AppDatabase {
         let val = updates[key];
         if (col.endsWith('_json') && typeof val !== 'string' && val !== null) {
           val = json(val);
-        } else if (col === 'stream') {
+        } else if (col === 'stream' || col === 'raw_call_marker_detected') {
           val = val ? 1 : 0;
         }
         params.push(val);

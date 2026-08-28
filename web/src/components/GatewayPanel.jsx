@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AGENT_ID, BACKEND_MODELS, copyText, formatDate, formatTokens, storageSet } from '../lib';
 
 export default function GatewayPanel({
@@ -12,7 +12,8 @@ export default function GatewayPanel({
   usageLogs = [],
   loadGateway,
   gatewayFetch,
-  selectedBackend
+  selectedBackend,
+  gatewaySettings
 }) {
   const [keyName, setKeyName] = useState('');
   const [keyValue, setKeyValue] = useState('');
@@ -32,6 +33,28 @@ export default function GatewayPanel({
 
   // Edit token modal
   const [editingToken, setEditingToken] = useState(null);
+  const [tpmStrategy, setTpmStrategy] = useState(gatewaySettings?.tpmStrategy === 'pace' ? 'pace' : 'frok');
+  const [tpmLimit, setTpmLimit] = useState(String(gatewaySettings?.tpmLimit ?? 100000));
+  const [tpmRatio, setTpmRatio] = useState(String(gatewaySettings?.tpmThresholdRatio ?? 0.8));
+  const [tpmWindowMs, setTpmWindowMs] = useState(String(gatewaySettings?.tpmWindowMs ?? 60000));
+  const [tpmPaceLimit, setTpmPaceLimit] = useState(String(gatewaySettings?.tpmPaceLimit ?? 100000));
+  const [tpmPaceMaxWaitMs, setTpmPaceMaxWaitMs] = useState(String(gatewaySettings?.tpmPaceMaxWaitMs ?? 20000));
+  const [tpmPaceDelayMs, setTpmPaceDelayMs] = useState(String(gatewaySettings?.tpmPaceDelayMs ?? 5000));
+  const [tpmReserveTtlMs, setTpmReserveTtlMs] = useState(String(gatewaySettings?.tpmReserveTtlMs ?? gatewaySettings?.tpmWindowMs ?? 60000));
+  const [migrationMaxInputTokens, setMigrationMaxInputTokens] = useState(String(gatewaySettings?.migrationMaxInputTokens ?? 24000));
+
+  useEffect(() => {
+    if (!gatewaySettings) return;
+    setTpmStrategy(gatewaySettings.tpmStrategy === 'pace' ? 'pace' : 'frok');
+    setTpmLimit(String(gatewaySettings.tpmLimit ?? 100000));
+    setTpmRatio(String(gatewaySettings.tpmThresholdRatio ?? 0.8));
+    setTpmWindowMs(String(gatewaySettings.tpmWindowMs ?? 60000));
+    setTpmPaceLimit(String(gatewaySettings.tpmPaceLimit ?? 100000));
+    setTpmPaceMaxWaitMs(String(gatewaySettings.tpmPaceMaxWaitMs ?? 20000));
+    setTpmPaceDelayMs(String(gatewaySettings.tpmPaceDelayMs ?? 5000));
+    setTpmReserveTtlMs(String(gatewaySettings.tpmReserveTtlMs ?? gatewaySettings.tpmWindowMs ?? 60000));
+    setMigrationMaxInputTokens(String(gatewaySettings.migrationMaxInputTokens ?? 24000));
+  }, [gatewaySettings]);
 
   const example = useMemo(() => {
     const origin = window.location.origin;
@@ -161,6 +184,9 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
               <div>
                 <b style={{ fontSize: 14 }}>{item.name}</b>
                 <div className="hint mono">…{item.suffix} {item.proxyUrl ? ('· 代理: ' + item.proxyUrl) : ''} · {item.enabled ? '🟢 已启用' : '⚪ 已停用'}</div>
+                <div className="hint" title="与 Google AI Studio RPD 日切一致，不用北京 0 点。对齐 AI Studio 日切，不是谷歌项目总额。">
+                  本分钟 {item.rpmUsed ?? 0} · 今日 {item.rpdUsed ?? 0} · 下次刷新 {item.rpdResetAt ? formatDate(item.rpdResetAt).slice(0, 16) : '-'}（太平洋时间午夜，随冬夏令时）
+                </div>
               </div>
               <span>
                 <button
@@ -187,6 +213,100 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
               </span>
             </div>
           ))}
+        </div>
+      </section>
+
+      <section className="box">
+        <div className="box-head">📈 TPM 策略</div>
+        <p className="hint">
+          两种策略二选一，保存后立即生效。默认「立即换 Key」与发版前行为一致。
+        </p>
+        <div className="row" style={{ gap: 16, marginBottom: 10 }}>
+          <label className="check">
+            <input type="radio" name="tpm-strategy" checked={tpmStrategy === 'frok'} onChange={() => setTpmStrategy('frok')} />
+            <span>立即换 Key（frok）</span>
+          </label>
+          <label className="check">
+            <input type="radio" name="tpm-strategy" checked={tpmStrategy === 'pace'} onChange={() => setTpmStrategy('pace')} />
+            <span>排队等待（同一把 Key）</span>
+          </label>
+        </div>
+        {tpmStrategy === 'frok' ? (
+          <p className="hint">
+            滑动窗口内用量达到「TPM 上限 × 触发比例」时，粘性会话会主动迁移到空闲 Key。
+            迁移时重建上下文不得超过 input token 预算。
+          </p>
+        ) : (
+          <p className="hint">
+            窗口内已用量+本轮预估必须小于 TPM 窗口才立刻上传（贴着 100k 不算能发）。否则等待腾出额度。预计等待超过「最长等待」则换 Key 重建。50k 会话要保上下文，最长等待需覆盖上一笔出窗剩余时间（常见 40s+）。窗口已能塞下后再额外延迟再上传。预约超时自动释放，防止异常占额度。
+          </p>
+        )}
+        <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
+          {tpmStrategy === 'frok' ? (
+            <>
+              <label className="label" style={{ minWidth: 140 }}>
+                TPM 上限
+                <input className="input" value={tpmLimit} onChange={(e) => setTpmLimit(e.target.value)} placeholder="100000" />
+              </label>
+              <label className="label" style={{ minWidth: 140 }}>
+                触发比例
+                <input className="input" value={tpmRatio} onChange={(e) => setTpmRatio(e.target.value)} placeholder="0.8" />
+              </label>
+            </>
+          ) : (
+            <>
+              <label className="label" style={{ minWidth: 140 }}>
+                TPM 窗口
+                <input className="input" value={tpmPaceLimit} onChange={(e) => setTpmPaceLimit(e.target.value)} placeholder="100000" />
+              </label>
+              <label className="label" style={{ minWidth: 140 }}>
+                最长等待 (毫秒)
+                <input className="input" value={tpmPaceMaxWaitMs} onChange={(e) => setTpmPaceMaxWaitMs(e.target.value)} placeholder="20000" />
+              </label>
+              <label className="label" style={{ minWidth: 140 }}>
+                额外延迟 (毫秒)
+                <input className="input" value={tpmPaceDelayMs} onChange={(e) => setTpmPaceDelayMs(e.target.value)} placeholder="5000" />
+              </label>
+              <label className="label" style={{ minWidth: 160 }}>
+                预约 TTL (毫秒)
+                <input className="input" value={tpmReserveTtlMs} onChange={(e) => setTpmReserveTtlMs(e.target.value)} placeholder="60000" />
+              </label>
+            </>
+          )}
+          <label className="label" style={{ minWidth: 140 }}>
+            窗口 (毫秒)
+            <input className="input" value={tpmWindowMs} onChange={(e) => setTpmWindowMs(e.target.value)} placeholder="60000" />
+          </label>
+          <label className="label" style={{ minWidth: 180 }}>
+            迁移 input token 预算
+            <input className="input" value={migrationMaxInputTokens} onChange={(e) => setMigrationMaxInputTokens(e.target.value)} placeholder="24000" />
+          </label>
+          <button
+            className="btn btn-primary"
+            onClick={async () => {
+              try {
+                await gatewayFetch('/api/gateway/settings', {
+                  method: 'PATCH',
+                  body: JSON.stringify({
+                    tpmStrategy,
+                    tpmLimit: Number(tpmLimit),
+                    tpmThresholdRatio: Number(tpmRatio),
+                    tpmWindowMs: Number(tpmWindowMs),
+                    tpmPaceLimit: Number(tpmPaceLimit),
+                    tpmPaceMaxWaitMs: Number(tpmPaceMaxWaitMs),
+                    tpmPaceDelayMs: Number(tpmPaceDelayMs),
+                    tpmReserveTtlMs: Number(tpmReserveTtlMs),
+                    migrationMaxInputTokens: Number(migrationMaxInputTokens)
+                  })
+                });
+                loadGateway();
+              } catch (err) {
+                setGatewayError(err.message);
+              }
+            }}
+          >
+            保存策略
+          </button>
         </div>
       </section>
 

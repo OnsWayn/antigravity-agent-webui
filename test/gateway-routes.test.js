@@ -10,6 +10,7 @@ const { encryptSecret, generateClientToken, keySuffix } = require('../gateway/cr
 const { createGatewayRouter } = require('../gateway/routes');
 const { createAdminRouter } = require('../gateway/admin-routes');
 const { createOriginGuard } = require('../http-security');
+const { RequestCounter } = require('../gateway/upstream');
 
 function listen(app) {
   return new Promise((resolve) => {
@@ -27,6 +28,7 @@ function request(base, pathname, { method = 'GET', headers = {}, body } = {}) {
     const req = http.request(url, {
       method,
       headers: {
+        Connection: 'close',
         ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}),
         ...headers
       }
@@ -52,24 +54,28 @@ function withApp(callUpstream, callback) {
   const masterKey = 'unit-master-key';
   const adminToken = 'unit-admin';
   const app = express();
+  const requestCounter = new RequestCounter();
   app.use(createOriginGuard({ port: 3999 }));
   app.use(express.json({ limit: '2mb' }));
   app.use(createGatewayRouter({
     database,
     masterKey,
     enabled: true,
-    callUpstream
+    callUpstream,
+    requestCounter
   }));
   app.use('/api/gateway', createAdminRouter({
     database,
     masterKey,
     adminToken,
-    enabled: true
+    enabled: true,
+    requestCounter
   }));
   return listen(app).then(async (ctx) => {
     try {
       await callback({ ...ctx, database, masterKey, adminToken });
     } finally {
+      if (typeof ctx.server.closeAllConnections === 'function') ctx.server.closeAllConnections();
       await new Promise((resolve) => ctx.server.close(resolve));
       database.close();
       fs.rmSync(directory, { recursive: true, force: true });
@@ -267,6 +273,7 @@ test('sticky key keeps environment; 429 x3 migrates context onto a new key and s
     assert.equal(migrated.previous_interaction_id, undefined);
     assert.match(JSON.stringify(migrated.input), /I wrote \/workspace\/a.txt/);
     assert.match(JSON.stringify(migrated.input), /keep going/);
+    assert.doesNotMatch(JSON.stringify(migrated.input), /\[Calls:/);
 
     calls.length = 0;
     const second = await request(base, '/v1/chat/completions', {
@@ -381,5 +388,348 @@ test('gateway request logs are stored and queryable via admin API', async () => 
     });
     assert.equal(deleteRes.status, 200);
     assert.equal(deleteRes.json.cleared, 1);
+  });
+});
+
+test('forked history does not overwrite the trunk conversation pointer', async () => {
+  let interaction = 0;
+  await withApp(async () => {
+    interaction += 1;
+    return {
+      id: `int-${interaction}`,
+      status: 'completed',
+      environment_id: `env-${interaction}`,
+      output_text: `out-${interaction}`,
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: `out-${interaction}` }] }],
+      usage: { total_input_tokens: 10, total_output_tokens: 2, total_tokens: 12 }
+    };
+  }, async ({ base, database, masterKey }) => {
+    const key = encryptSecret('key-a', masterKey);
+    database.insertUpstreamKey({
+      name: 'A',
+      ciphertext: key.ciphertext,
+      iv: key.iv,
+      tag: key.tag,
+      suffix: 'keya'
+    });
+    const generated = generateClientToken();
+    database.insertClientToken({
+      name: 'client',
+      tokenHash: generated.tokenHash,
+      tokenPrefix: generated.tokenPrefix,
+      quotaTokens: -1
+    });
+    const headers = {
+      Authorization: `Bearer ${generated.token}`,
+      'x-session-id': 'stable-session'
+    };
+
+    const first = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'antigravity-preview-05-2026',
+        messages: [{ role: 'user', content: 'hello sandbox' }]
+      }
+    });
+    assert.equal(first.status, 200);
+    const tokenRow = database.listClientTokens()[0];
+    const trunkBefore = database.getGatewayConversation(tokenRow.id, 'hdr:stable-session');
+    assert.equal(trunkBefore.interaction_id, 'int-1');
+
+    const forked = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'antigravity-preview-05-2026',
+        messages: [
+          { role: 'user', content: 'unrelated summary of earlier chat' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'new question' }
+        ]
+      }
+    });
+    assert.equal(forked.status, 200);
+    const trunkAfter = database.getGatewayConversation(tokenRow.id, 'hdr:stable-session');
+    assert.equal(trunkAfter.interaction_id, trunkBefore.interaction_id);
+    assert.equal(trunkAfter.environment_id, trunkBefore.environment_id);
+    const branches = database.listGatewayConversationsForSource(tokenRow.id, 'hdr:stable-session')
+      .filter((row) => row.conversation_key !== 'hdr:stable-session');
+    assert.ok(branches.length >= 1);
+    assert.equal(branches[0].interaction_id, 'int-2');
+  });
+});
+
+test('admin settings expose and update TPM limits', async () => {
+  await withApp(async () => ({
+    id: 'int-x',
+    status: 'completed',
+    environment_id: 'env-x',
+    output_text: 'ok',
+    steps: [],
+    usage: { total_tokens: 1 }
+  }), async ({ base, adminToken, database }) => {
+    const getRes = await request(base, '/api/gateway/settings', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(getRes.status, 200);
+    assert.equal(getRes.json.settings.tpmLimit, 100000);
+
+    const patchRes = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { tpmLimit: 8000, tpmThresholdRatio: 0.5, tpmWindowMs: 30000, migrationMaxInputTokens: 4096 }
+    });
+    assert.equal(patchRes.status, 200);
+    assert.equal(patchRes.json.settings.tpmLimit, 8000);
+    assert.equal(database.getGatewaySettingsMap().tpmLimit, 8000);
+
+    const statusRes = await request(base, '/api/gateway/status');
+    assert.equal(statusRes.json.settings.tpmLimit, 8000);
+  });
+});
+
+test('settings PATCH round-trips pace fields, TTL, and invalid strategy falls back to frok', async () => {
+  await withApp(async () => ({}), async ({ base, adminToken }) => {
+    const patchRes = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: {
+        tpmStrategy: 'pace',
+        tpmPaceLimit: 90000,
+        tpmPaceMaxWaitMs: 15000,
+        tpmPaceDelayMs: 1000,
+        tpmReserveTtlMs: 12000,
+        tpmWindowMs: 30000
+      }
+    });
+    assert.equal(patchRes.status, 200);
+    assert.equal(patchRes.json.settings.tpmStrategy, 'pace');
+    assert.equal(patchRes.json.settings.tpmPaceLimit, 90000);
+    assert.equal(patchRes.json.settings.tpmPaceMaxWaitMs, 15000);
+    assert.equal(patchRes.json.settings.tpmPaceDelayMs, 1000);
+    assert.equal(patchRes.json.settings.tpmReserveTtlMs, 12000);
+
+    const bad = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { tpmStrategy: 'nope' }
+    });
+    assert.equal(bad.status, 200);
+    assert.equal(bad.json.settings.tpmStrategy, 'pace');
+  });
+});
+
+function seedGatewayClient(database, masterKey, { keys = ['gemini-test-key'] } = {}) {
+  const inserted = keys.map((secret, index) => database.insertUpstreamKey({
+    name: `key-${index}`,
+    ...encryptSecret(secret, masterKey),
+    suffix: keySuffix(secret)
+  }));
+  const generated = generateClientToken();
+  database.insertClientToken({
+    name: 'client',
+    tokenHash: generated.tokenHash,
+    tokenPrefix: generated.tokenPrefix,
+    quotaTokens: -1
+  });
+  return {
+    keys: inserted,
+    token: generated.token,
+    headers: { Authorization: `Bearer ${generated.token}`, 'x-session-id': 'pace-session' }
+  };
+}
+
+test('successful callUpstream increments rpmUsed and rpdUsed on GET /keys', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    return {
+      id: `int-${calls}`,
+      status: 'completed',
+      environment_id: 'env-count',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 11 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    const first = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hi' }] };
+    const second = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'next' }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: first })).status, 200);
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: second })).status, 200);
+    const keysRes = await request(base, '/api/gateway/keys', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(keysRes.status, 200);
+    const key = keysRes.json.keys[0];
+    assert.ok(key.rpmUsed >= 2);
+    assert.ok(key.rpdUsed >= 2);
+    assert.equal(typeof key.rpdResetAt, 'number');
+    assert.match(String(key.rpdDay), /^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+test('abort during TPM pacing wait does not increment request counts', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    return {
+      id: `int-wait-${calls}`,
+      status: 'completed',
+      environment_id: 'env-wait',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 800 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    const patched = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: {
+        tpmStrategy: 'pace',
+        tpmPaceLimit: 1000,
+        tpmWindowMs: 1000,
+        tpmPaceMaxWaitMs: 1000,
+        tpmPaceDelayMs: 0,
+        tpmReserveTtlMs: 1000
+      }
+    });
+    assert.equal(patched.status, 200);
+    const first = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'wait-me' }] };
+    const second = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'wait-me' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'wait-again' }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: first })).status, 200);
+    assert.equal(calls, 1);
+
+    await new Promise((resolve, reject) => {
+      const url = new URL('/v1/chat/completions', base);
+      const payload = Buffer.from(JSON.stringify(second));
+      const req = http.request(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': payload.length,
+          ...headers
+        }
+      }, () => {});
+      req.on('error', () => resolve());
+      req.write(payload);
+      req.end();
+      setTimeout(() => {
+        req.destroy();
+        resolve();
+      }, 80);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    assert.equal(calls, 1);
+
+    const keysRes = await request(base, '/api/gateway/keys', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(keysRes.json.keys[0].rpdUsed, 1);
+  });
+});
+
+test('pace waits when the next round cannot strictly fit, and froks when wait exceeds max', async () => {
+  const timestamps = [];
+  const payloads = [];
+  await withApp(async ({ payload }) => {
+    timestamps.push(Date.now());
+    payloads.push(payload);
+    return {
+      id: `int-pace-${timestamps.length}`,
+      status: 'completed',
+      environment_id: `env-pace-${timestamps.length}`,
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 800 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey, { keys: ['secret-a', 'secret-b'] });
+    const patched = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: {
+        tpmStrategy: 'pace',
+        tpmPaceLimit: 1000,
+        tpmWindowMs: 1000,
+        tpmPaceMaxWaitMs: 2000,
+        tpmPaceDelayMs: 0,
+        tpmReserveTtlMs: 1000
+      }
+    });
+    assert.equal(patched.status, 200);
+    const first = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'pace-hi' }] };
+    const second = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'pace-hi' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'pace-next' }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: first })).status, 200);
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: second })).status, 200);
+    assert.ok(timestamps[1] - timestamps[0] >= 700);
+    assert.equal(payloads[1].previous_interaction_id, 'int-pace-1');
+  });
+});
+
+test('pace froks immediately when estimated wait exceeds maxWait', async () => {
+  const payloads = [];
+  await withApp(async ({ payload }) => {
+    payloads.push(payload);
+    return {
+      id: `int-frok-${payloads.length}`,
+      status: 'completed',
+      environment_id: `env-frok-${payloads.length}`,
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 800 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey, { keys: ['secret-a', 'secret-b'] });
+    const patched = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: {
+        tpmStrategy: 'pace',
+        tpmPaceLimit: 1000,
+        tpmWindowMs: 60000,
+        tpmPaceMaxWaitMs: 0,
+        tpmPaceDelayMs: 0,
+        tpmReserveTtlMs: 60000
+      }
+    });
+    assert.equal(patched.status, 200);
+    const first = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'frok-hi' }] };
+    const second = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'frok-hi' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'frok-next' }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: first })).status, 200);
+    const started = Date.now();
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: second })).status, 200);
+    assert.ok(Date.now() - started < 2000);
+    assert.equal(payloads[1].previous_interaction_id, undefined);
   });
 });

@@ -1,9 +1,43 @@
 function createSessionLockManager({
+  // Queue wait limit for waiters. The holder is never timed out.
   defaultTimeoutMs = 120000,
   defaultQueueLimit = 3,
   onLockEvent = () => {}
 } = {}) {
   const locks = new Map();
+
+  function busyError(message) {
+    const error = new Error(message);
+    error.status = 429;
+    error.code = 'session_busy';
+    return error;
+  }
+
+  function getOrCreate(sessionKey) {
+    let lockEntry = locks.get(sessionKey);
+    if (!lockEntry) {
+      lockEntry = {
+        running: false,
+        currentRequestId: null,
+        queue: []
+      };
+      locks.set(sessionKey, lockEntry);
+    }
+    return lockEntry;
+  }
+
+  function clearWaiterTimer(item) {
+    if (item?.timer) {
+      clearTimeout(item.timer);
+      item.timer = null;
+    }
+  }
+
+  function grantTo(lockEntry, sessionKey, requestId, resolve) {
+    lockEntry.running = true;
+    lockEntry.currentRequestId = requestId;
+    resolve(() => releaseLock(sessionKey, requestId));
+  }
 
   async function acquireLock(sessionKey, {
     requestId = 'unknown',
@@ -14,40 +48,15 @@ function createSessionLockManager({
       return () => {};
     }
 
-    let lockEntry = locks.get(sessionKey);
-    if (!lockEntry) {
-      lockEntry = {
-        running: false,
-        currentRequestId: null,
-        queue: [],
-        timer: null
-      };
-      locks.set(sessionKey, lockEntry);
-    }
+    const lockEntry = getOrCreate(sessionKey);
 
     if (!lockEntry.running) {
       lockEntry.running = true;
       lockEntry.currentRequestId = requestId;
-
-      if (timeoutMs > 0) {
-        lockEntry.timer = setTimeout(() => {
-          onLockEvent('warn', 'session_lock_timeout', {
-            sessionKey,
-            requestId,
-            timeoutMs
-          });
-          releaseLock(sessionKey, requestId);
-        }, timeoutMs);
-        if (typeof lockEntry.timer.unref === 'function') {
-          lockEntry.timer.unref();
-        }
-      }
-
       onLockEvent('debug', 'session_lock_acquired', { sessionKey, requestId });
       return () => releaseLock(sessionKey, requestId);
     }
 
-    // Lock is currently held, check queue limit
     if (lockEntry.queue.length >= queueLimit) {
       onLockEvent('warn', 'session_lock_rejected_busy', {
         sessionKey,
@@ -55,28 +64,47 @@ function createSessionLockManager({
         currentRequestId: lockEntry.currentRequestId,
         queueLength: lockEntry.queue.length
       });
-      const error = new Error(`Session is busy processing another request (${lockEntry.queue.length} in queue)`);
-      error.status = 429;
-      error.code = 'session_busy';
-      throw error;
+      throw busyError(`Session is busy processing another request (${lockEntry.queue.length} in queue)`);
     }
 
     onLockEvent('debug', 'session_lock_queued', {
       sessionKey,
       requestId,
-      queuePosition: lockEntry.queue.length + 1
+      queuePosition: lockEntry.queue.length + 1,
+      currentRequestId: lockEntry.currentRequestId
     });
 
     return new Promise((resolve, reject) => {
-      lockEntry.queue.push({
+      const item = {
         requestId,
-        timeoutMs,
+        timer: null,
         resolve: () => {
+          clearWaiterTimer(item);
           onLockEvent('debug', 'session_lock_acquired_from_queue', { sessionKey, requestId });
-          resolve(() => releaseLock(sessionKey, requestId));
+          grantTo(lockEntry, sessionKey, requestId, resolve);
         },
-        reject
-      });
+        reject: (error) => {
+          clearWaiterTimer(item);
+          reject(error);
+        }
+      };
+
+      if (timeoutMs > 0) {
+        item.timer = setTimeout(() => {
+          const idx = lockEntry.queue.indexOf(item);
+          if (idx >= 0) lockEntry.queue.splice(idx, 1);
+          onLockEvent('warn', 'session_lock_wait_timeout', {
+            sessionKey,
+            requestId,
+            currentRequestId: lockEntry.currentRequestId,
+            timeoutMs
+          });
+          item.reject(busyError(`Session is busy; waited ${timeoutMs}ms for lock`));
+        }, timeoutMs);
+        if (typeof item.timer.unref === 'function') item.timer.unref();
+      }
+
+      lockEntry.queue.push(item);
     });
   }
 
@@ -85,37 +113,25 @@ function createSessionLockManager({
     const lockEntry = locks.get(sessionKey);
     if (!lockEntry) return;
 
-    if (lockEntry.timer) {
-      clearTimeout(lockEntry.timer);
-      lockEntry.timer = null;
+    if (lockEntry.running && lockEntry.currentRequestId !== requestId) {
+      onLockEvent('debug', 'session_lock_release_ignored', {
+        sessionKey,
+        requestId,
+        currentRequestId: lockEntry.currentRequestId
+      });
+      return;
     }
 
     if (lockEntry.queue.length > 0) {
       const next = lockEntry.queue.shift();
-      lockEntry.running = true;
-      lockEntry.currentRequestId = next.requestId;
-
-      if (next.timeoutMs > 0) {
-        lockEntry.timer = setTimeout(() => {
-          onLockEvent('warn', 'session_lock_timeout', {
-            sessionKey,
-            requestId: next.requestId,
-            timeoutMs: next.timeoutMs
-          });
-          releaseLock(sessionKey, next.requestId);
-        }, next.timeoutMs);
-        if (typeof lockEntry.timer.unref === 'function') {
-          lockEntry.timer.unref();
-        }
-      }
-
       next.resolve();
-    } else {
-      lockEntry.running = false;
-      lockEntry.currentRequestId = null;
-      locks.delete(sessionKey);
-      onLockEvent('debug', 'session_lock_released', { sessionKey, requestId });
+      return;
     }
+
+    lockEntry.running = false;
+    lockEntry.currentRequestId = null;
+    locks.delete(sessionKey);
+    onLockEvent('debug', 'session_lock_released', { sessionKey, requestId });
   }
 
   return {

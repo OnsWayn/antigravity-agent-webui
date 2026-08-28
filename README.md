@@ -6,7 +6,7 @@ A high-performance **OpenAI / Gemini protocol gateway** and **management dashboa
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.7.0** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.7.3** · Node.js **22.5+** · License **Apache-2.0**
 
 ## Why this project exists
 
@@ -90,6 +90,17 @@ If the server was already running before a code update, restart Node.js and perf
 | `GATEWAY_MASTER_KEY` | empty | Required to encrypt upstream Gemini keys and enable the gateway. |
 | `GATEWAY_ADMIN_TOKEN` | empty | Bearer token for the gateway admin API and WebUI panel. |
 | `GATEWAY_ENFORCE_SESSION_HEADER` | `false` | When `true`, requires downstream requests to specify `x-session-id`, returning 400 if omitted. |
+| `GATEWAY_TPM_STRATEGY` | `frok` | `frok` rotates off a hot key immediately; `pace` waits on the same key until the next round strictly fits. |
+| `GATEWAY_TPM_LIMIT` | `100000` | Strategy A: sliding-window TPM budget that triggers proactive key rotation. |
+| `GATEWAY_TPM_THRESHOLD_RATIO` | `0.8` | Strategy A: rotate when recent usage reaches `limit * ratio`. |
+| `GATEWAY_TPM_PACE_LIMIT` | `100000` | Strategy B: send only when `recent usage + estimated round < this window`. |
+| `GATEWAY_TPM_WINDOW_MS` | `60000` | TPM sliding window in milliseconds (shared). |
+| `GATEWAY_TPM_PACE_MAX_WAIT_MS` | `20000` | Strategy B: if estimated wait exceeds this, fall back to frok. |
+| `GATEWAY_TPM_PACE_DELAY_MS` | `5000` | Strategy B: extra delay after the window can fit. |
+| `GATEWAY_TPM_RESERVE_TTL_MS` | follows window | Strategy B: auto-release a TPM reservation if `finally` never runs. |
+| `GATEWAY_MIGRATION_MAX_INPUT_TOKENS` | `24000` | Max estimated tokens for rebuilt context after a key change. |
+
+These TPM / migration values are defaults. The WebUI **协议中转站** panel and `GET/PATCH /api/gateway/settings` override them at runtime (no restart). Priority: WebUI / admin API > environment variables > code defaults. Each upstream key also shows this-minute RPM (memory) and today RPD (SQLite, Pacific midnight aligned with Google AI Studio).
 
 A proxy can also be configured in the WebUI. Explicitly disabling it in the UI prevents the server from using proxy environment variables for that request.
 
@@ -161,21 +172,23 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 ## Protocol gateway
 
-Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open the **协议中转站** tab. Add an upstream Gemini key (stored encrypted) and create a downstream `ag-` token. Other apps should send that token, never the Gemini key.
+Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open the **协议中转站** tab. Add an upstream Gemini key (stored encrypted) and create a downstream `ag-` token. Other apps should send that token, never the Gemini key. TPM strategy, limits, pacing waits, and the migration input budget can be changed in that same panel.
 
 The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. Allowed `agent_config.model` values are `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and `gemini-3.5-flash-lite`.
 
-Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s a key cools down for 60 seconds, and the gateway seamlessly migrates the full conversation context (including pending tool results) onto another key with a **new** sandbox, preserving execution continuity without dropping context or creating orphan tool results.
+Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s the gateway migrates conversation context onto another key with a **new** sandbox. The default TPM strategy (`frok`) also migrates when recent usage hits `limit × ratio`. The optional `pace` strategy keeps the sticky key and waits until `recent usage + this round` is strictly below the TPM window; if the wait would exceed `tpmPaceMaxWaitMs` it still froks. Downstream `conversation_mode` stays `continue`; the upstream hop is marked `frok` (key-rotation rebuild), not `new`. Tool history is sent as a non-executable summary (not `[Calls:]` templates) so the model cannot imitate fake tool traces.
+
+Standard OpenAI clients do not need extra session fields. If the client compresses, truncates, or replays old messages and the gateway cannot prove continuity, it **forks** onto a derived internal key and leaves the trunk `interaction_id` unchanged.
 
 ### Session Isolation & Concurrency Control
 
 - **Session Isolation**: Downstream clients (e.g. multi-user chat bots or separate windows) should pass `x-session-id` (e.g., `qq:private:{user_id}` or `qq:group:{group_id}`). Each session maintains an isolated context chain and sandbox environment, even when sharing the same downstream token.
 - **Mutex Concurrency Locks**: Concurrent requests for the same `x-session-id` are queued and executed sequentially to prevent state collisions. Excess requests return HTTP 429 `session_busy`.
-- **End-to-End Trace Logs**: Every request is assigned a unique `request_id`, with automatic redaction of API keys, tokens, large Base64 images, and system instructions.
+- **End-to-End Trace Logs**: Every request is assigned a unique `request_id`, with automatic redaction of API keys, tokens, large Base64 images, and system instructions. Logs record both `conversation_mode` (`continue` / `new` / `fork`) and `upstream_transition` (`none` / `frok`). `[Calls:]` in model text is counted only, never executed.
 
 > **Note:** The model list above is hardcoded in `gateway/models.js` and `web/src/lib.js`. Google does not currently provide an API to query which `agent_config.model` values a managed agent supports — the standard `/v1beta/models` endpoint only returns standalone Gemini models, not agent-internal engine options. If Google adds or removes supported models in the future, these two files must be updated manually.
 
-Conversation state uses `previous_interaction_id`. Client-replayed `messages[]` are treated as a delta, not resent in full. Images (`image_url` / `inline_data`) are forwarded. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
+Conversation state uses `previous_interaction_id`. When the request is a proven continuation, client-replayed `messages[]` are treated as a delta and only the new turn is sent upstream. Unverifiable compressed or truncated history forks instead of being hard-attached to the old chain. Images (`image_url` / `inline_data`) are forwarded. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
 
 The gateway does **not** expose the Gemini model catalog on the API key. It only serves the Antigravity agent and the four `agent_config.model` backends that agent accepts:
 
@@ -204,7 +217,7 @@ See [SECURITY.md](SECURITY.md) for the complete security policy.
 
 ```text
 server.js             Express API, Gemini requests, file routes, and gateway mount
-gateway/              OpenAI / Gemini protocol adapters, token auth, and admin API
+gateway/              OpenAI / Gemini protocol adapters, token auth, admin API, and TPM settings
 database.js           SQLite schema, migrations, and session persistence
 environment-files.js  TAR path normalization and safe extraction
 snapshot-cache.js     Snapshot cache and concurrent-download deduplication

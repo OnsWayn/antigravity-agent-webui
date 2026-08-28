@@ -2,7 +2,7 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 
 export const AGENT_ID = 'antigravity-preview-05-2026';
-export const APP_VERSION = '1.7.0';
+export const APP_VERSION = '1.7.3';
 
 export const BACKEND_MODELS = [
   { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', hint: '默认 · 推理 / 编码 / 工具' },

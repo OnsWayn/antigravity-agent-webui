@@ -113,9 +113,19 @@ async function callInteractions({
   try {
     response = await fetch(url, options);
   } catch (error) {
-    const wrapped = new Error(`网络连接至 Google Gemini API 失败: ${error.message}`);
+    const cause = error.cause || {};
+    const detail = [
+      error.message,
+      error.code,
+      cause.code,
+      cause.message
+    ].filter((part, index, all) => part && all.indexOf(part) === index).join(' | ');
+    const wrapped = new Error(
+      `网络连接至 Google Gemini API 失败: ${detail || 'unknown error'}`
+      + (proxy ? `（代理 ${proxy}）` : '（未使用代理，请在上游 Key 或 .env 的 HTTPS_PROXY 中配置）')
+    );
     wrapped.status = 502;
-    wrapped.code = 'FETCH_FAILED';
+    wrapped.code = error.code || cause.code || 'FETCH_FAILED';
     throw wrapped;
   }
 

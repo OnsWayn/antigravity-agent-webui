@@ -227,6 +227,18 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                   <span className="meta-label">🔗 会话:</span>
                   <span className="meta-val mono">{log.conversation_key || '无'}</span>
                   <span className="tag" style={{ marginLeft: 4 }}>模式: {log.conversation_mode || 'stateless'}</span>
+                  {log.upstream_transition && log.upstream_transition !== 'none' && (
+                    <span className="tag" style={{ marginLeft: 4 }}>上游: {log.upstream_transition}</span>
+                  )}
+                  {log.context_rebuild_reason && (
+                    <span className="tag" style={{ marginLeft: 4 }}>原因: {log.context_rebuild_reason}</span>
+                  )}
+                  {log.fork_reason && (
+                    <span className="tag" style={{ marginLeft: 4 }}>fork: {log.fork_reason}</span>
+                  )}
+                  {Number(log.raw_call_marker_count) > 0 && (
+                    <span className="badge warn" style={{ marginLeft: 4 }}>[Calls:] × {log.raw_call_marker_count}</span>
+                  )}
                 </div>
 
                 {log.model && (

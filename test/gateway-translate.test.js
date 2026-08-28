@@ -241,9 +241,11 @@ test('preserves multi-turn conversation and tool calls history on new and fork m
   assert.equal(Array.isArray(convNew.input), true);
   const inputStr = JSON.stringify(convNew.input);
   assert.match(inputStr, /read file foo\.txt/);
-  assert.match(inputStr, /Tool result \(read_file\): hello world contents/);
+  assert.match(inputStr, /hello world contents/);
   assert.match(inputStr, /file content is hello world/);
   assert.match(inputStr, /what was in the file\?/);
+  assert.doesNotMatch(inputStr, /\[Calls:/);
+  assert.doesNotMatch(inputStr, /Tool result \(/);
 
   // Fork mode with mismatched prefix hash
   const convFork = buildOpenAIConversation({
@@ -259,6 +261,92 @@ test('preserves multi-turn conversation and tool calls history on new and fork m
   assert.equal(Array.isArray(convFork.input), true);
   const forkInputStr = JSON.stringify(convFork.input);
   assert.match(forkInputStr, /read file foo\.txt/);
-  assert.match(forkInputStr, /Tool result \(read_file\): hello world contents/);
+  assert.match(forkInputStr, /hello world contents/);
   assert.match(forkInputStr, /what was in the file\?/);
+  assert.doesNotMatch(forkInputStr, /\[Calls:/);
+  assert.doesNotMatch(forkInputStr, /Tool result \(/);
+  assert.equal(convFork.forkReason, 'prefix_mismatch');
+  assert.match(convFork.targetConversationKey, /:fork:/);
+});
+
+test('summarizeToolHistory keeps call ids and never emits [Calls:] templates', () => {
+  const { summarizeToolHistory, flattenMessagesToInput, migrateConversationForKeyChange } = require('../gateway/translate');
+  const messages = [
+    { role: 'user', content: 'run python' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_123', function: { name: 'astrbot_execute_python', arguments: '{"code":"print(1)"}' } }]
+    },
+    { role: 'tool', tool_call_id: 'call_123', name: 'astrbot_execute_python', content: 'PIL available; cairosvg available' },
+    { role: 'assistant', content: 'done' },
+    { role: 'user', content: 'continue' }
+  ];
+  const summary = summarizeToolHistory(messages);
+  assert.equal(summary.summaries.length, 1);
+  assert.equal(summary.summaries[0].callId, 'call_123');
+  assert.equal(summary.summaries[0].name, 'astrbot_execute_python');
+  assert.match(summary.summaries[0].resultPreview, /PIL available/);
+
+  const flattened = JSON.stringify(flattenMessagesToInput(messages));
+  assert.doesNotMatch(flattened, /\[Calls:/);
+  assert.doesNotMatch(flattened, /Tool result \(/);
+  assert.match(flattened, /astrbot_execute_python/);
+  assert.match(flattened, /call_123/);
+
+  const migrated = migrateConversationForKeyChange({
+    input: 'continue',
+    environment: 'env-old',
+    previousInteractionId: 'int-old',
+    mode: 'continue',
+    conversationKey: 'hdr:qq:1'
+  }, { messages });
+  assert.equal(migrated.mode, 'migrate');
+  assert.equal(migrated.upstreamTransition, 'frok');
+  const migratedText = JSON.stringify(migrated.input);
+  assert.doesNotMatch(migratedText, /\[Calls:/);
+  assert.match(migratedText, /NEW sandbox/);
+  assert.match(migratedText, /call_123/);
+});
+
+test('replayed early user message forks instead of continuing', () => {
+  const first = [
+    { role: 'user', content: '今天新闻' },
+    { role: 'assistant', content: '头条如下' },
+    { role: 'user', content: '再详细点' }
+  ];
+  const stored = {
+    interaction_id: 'int-1',
+    environment_id: 'env-1',
+    prefix_hash: hashNonAssistant(first.slice(0, -1)),
+    transcript_json: JSON.stringify([
+      { role: 'user', text: '今天新闻' },
+      { role: 'assistant', text: '头条如下' },
+      { role: 'user', text: '再详细点' }
+    ]),
+    conversation_key: 'hdr:s1'
+  };
+  const replayed = buildOpenAIConversation({
+    messages: [{ role: 'user', content: '今天新闻' }],
+    headers: { 'x-session-id': 's1' },
+    stored
+  });
+  assert.equal(replayed.mode, 'fork');
+  assert.equal(replayed.forkReason, 'replayed_old_message');
+  assert.equal(replayed.previousInteractionId, undefined);
+  assert.match(replayed.targetConversationKey, /:fork:/);
+});
+
+test('orphan tool calls are recorded without invented results', () => {
+  const { summarizeToolHistory } = require('../gateway/translate');
+  const summary = summarizeToolHistory([
+    {
+      role: 'assistant',
+      tool_calls: [{ id: 'call_orphan', function: { name: 'lookup', arguments: '{}' } }]
+    }
+  ]);
+  assert.equal(summary.summaries.length, 0);
+  assert.equal(summary.orphans.length, 1);
+  assert.equal(summary.orphans[0].callId, 'call_orphan');
+  assert.equal(summary.toolTraceStatus, 'orphan');
 });

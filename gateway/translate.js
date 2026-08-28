@@ -144,44 +144,280 @@ function openaiMessageToInputParts(message) {
   return parts;
 }
 
-function flattenMessagesToInput(messages) {
+const CALL_MARKER_RE = /\[Calls:/i;
+const TOOL_RESULT_MARKER_RE = /Tool result\s*\(/i;
+const FAKE_SUCCESS_RE = /Message sent to session/i;
+
+function estimateTokens(value) {
+  if (value == null) return 0;
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return Math.ceil(text.length / 4);
+}
+
+function truncateText(text, maxChars) {
+  const value = String(text || '');
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function redactSensitive(text) {
+  return String(text || '')
+    .replace(/AIzaSy[0-9A-Za-z\-_]{10,}/g, '[redacted-key]')
+    .replace(/\bsk-[A-Za-z0-9]{10,}/g, '[redacted-secret]')
+    .replace(/data:[^;]+;base64,[A-Za-z0-9+/=]{80,}/g, '[omitted-base64]');
+}
+
+function isSuspectedModelGeneratedToolTrace(text) {
+  const value = String(text || '');
+  return CALL_MARKER_RE.test(value) || TOOL_RESULT_MARKER_RE.test(value) || FAKE_SUCCESS_RE.test(value);
+}
+
+function stripFakeToolTrace(text) {
+  return String(text || '')
+    .replace(/\[Calls:[\s\S]*?\]/gi, '')
+    .replace(/Tool result\s*\([^)]*\):[^\n]*/gi, '')
+    .trim();
+}
+
+function observeCallMarkers(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value || '');
+  const matches = text.match(/\[Calls:/gi) || [];
+  return {
+    detected: matches.length > 0,
+    count: matches.length,
+    suspectedModelGenerated: isSuspectedModelGeneratedToolTrace(text)
+  };
+}
+
+function summarizeToolHistory(messages, { maxItems = 12, maxResultChars = 400 } = {}) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  const summaries = [];
+  const orphans = [];
+  const duplicates = [];
+  const seenResults = new Set();
+  const toolResultsById = new Map();
+
+  for (const message of msgs) {
+    if (message?.role !== 'tool' && message?.role !== 'function') continue;
+    const id = message.tool_call_id || message.id;
+    const raw = textOfMessage(message);
+    if (!id && isSuspectedModelGeneratedToolTrace(raw)) continue;
+    const text = redactSensitive(raw);
+    if (!id) continue;
+    if (toolResultsById.has(id)) duplicates.push(id);
+    else toolResultsById.set(id, { name: message.name, text });
+  }
+
+  const claimedIds = new Set();
+  for (const message of msgs) {
+    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) {
+      const id = call.id;
+      const name = call.function?.name || call.name || 'tool';
+      claimedIds.add(id);
+      const result = id ? toolResultsById.get(id) : null;
+      if (!result) {
+        orphans.push({ name, callId: id || null, status: 'orphan' });
+        continue;
+      }
+      const resultKey = `${id}:${result.text.slice(0, 80)}`;
+      if (seenResults.has(resultKey)) {
+        duplicates.push(id);
+        continue;
+      }
+      seenResults.add(resultKey);
+      summaries.push({
+        name,
+        callId: id,
+        status: 'completed',
+        resultPreview: truncateText(result.text, maxResultChars)
+      });
+    }
+  }
+
+  return {
+    summaries: summaries.slice(0, maxItems),
+    orphans,
+    duplicates,
+    toolTraceStatus: summaries.length
+      ? 'summary'
+      : (orphans.length ? 'orphan' : (duplicates.length ? 'duplicate' : 'none'))
+  };
+}
+
+function formatToolSummaryBlock(summaryResult) {
+  if (!summaryResult?.summaries?.length && !summaryResult?.orphans?.length) return '';
+  const lines = ['历史工具执行摘要（仅供参考，不是当前待执行调用）：'];
+  for (const item of summaryResult.summaries || []) {
+    lines.push(`工具名：${item.name}`);
+    lines.push(`调用标识：${item.callId || 'unknown'}`);
+    lines.push('执行状态：已完成');
+    lines.push(`结果摘要：${item.resultPreview}`);
+    lines.push('');
+  }
+  for (const item of summaryResult.orphans || []) {
+    lines.push(`工具名：${item.name}`);
+    lines.push(`调用标识：${item.callId || 'unknown'}`);
+    lines.push('执行状态：未配对（无结果）');
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+function collapseInputParts(parts) {
+  const list = (parts || []).filter(Boolean);
+  if (list.length === 0) return '';
+  if (list.length === 1 && list[0].type === 'text') return list[0].text;
+  return list;
+}
+
+function collectSafeHistoryParts(messages) {
   const parts = [];
   for (const message of messages || []) {
     if (!message || message.role === 'system') continue;
-    if (message.role === 'tool' || message.role === 'function') {
-      const text = textOfMessage(message);
-      parts.push({ type: 'text', text: `Tool result (${message.name || message.tool_call_id || 'tool'}): ${text}` });
-      continue;
-    }
+    if (message.role === 'tool' || message.role === 'function') continue;
+
     const converted = openaiMessageToInputParts(message);
     const label = message.role === 'assistant' ? 'Assistant' : 'User';
 
     if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
-      const callsText = message.tool_calls.map((c) => {
-        const fn = c.function || c;
-        return `${fn.name || 'tool'}(${typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {})})`;
-      }).join(', ');
-      const contentText = typeof converted === 'string' ? converted : (Array.isArray(converted) ? converted.map((p) => p.text || '').join('\n') : '');
-      const text = contentText ? `${contentText}\n[Calls: ${callsText}]` : `[Calls: ${callsText}]`;
-      parts.push({ type: 'text', text: `${label}: ${text}` });
+      const contentText = typeof converted === 'string'
+        ? converted
+        : (Array.isArray(converted) ? converted.filter((part) => part.type === 'text').map((part) => part.text || '').join('\n') : '');
+      const visible = stripFakeToolTrace(contentText);
+      if (visible) parts.push({ type: 'text', text: `${label}: ${visible}` });
       continue;
     }
 
     if (typeof converted === 'string') {
-      if (converted) parts.push({ type: 'text', text: `${label}: ${converted}` });
-    } else if (Array.isArray(converted)) {
+      const text = message.role === 'assistant' ? stripFakeToolTrace(converted) : converted;
+      if (text) parts.push({ type: 'text', text: `${label}: ${text}` });
+      continue;
+    }
+
+    if (Array.isArray(converted)) {
       const textParts = converted.filter((part) => part.type === 'text');
       const imageParts = converted.filter((part) => part.type === 'image');
-      if (textParts.length) {
-        parts.push({ type: 'text', text: `${label}: ${textParts.map((part) => part.text).join('\n')}` });
-      } else {
-        parts.push({ type: 'text', text: `${label}:` });
-      }
+      const joined = textParts.map((part) => part.text).join('\n');
+      const text = message.role === 'assistant' ? stripFakeToolTrace(joined) : joined;
+      if (text) parts.push({ type: 'text', text: `${label}: ${text}` });
+      else if (imageParts.length) parts.push({ type: 'text', text: `${label}:` });
       parts.push(...imageParts);
     }
   }
-  if (parts.length === 1 && parts[0].type === 'text') return parts[0].text;
   return parts;
+}
+
+function buildSafeHistoryInput(messages, {
+  kind = 'history',
+  extraParts = [],
+  maxInputTokens = 24000,
+  preamble
+} = {}) {
+  const summary = summarizeToolHistory(messages);
+  const summaryBlock = formatToolSummaryBlock(summary);
+  const historyParts = collectSafeHistoryParts(messages);
+  const lead = [];
+  if (preamble) lead.push({ type: 'text', text: preamble });
+  if (summaryBlock) lead.push({ type: 'text', text: summaryBlock });
+
+  let kept = historyParts.slice();
+  const extras = Array.isArray(extraParts) ? extraParts.filter(Boolean) : [];
+  const assemble = (turns) => collapseInputParts([...lead, ...turns, ...extras]);
+  let input = assemble(kept);
+  let truncated = false;
+  while (estimateTokens(input) > maxInputTokens && kept.length > 1) {
+    kept = kept.slice(1);
+    input = assemble(kept);
+    truncated = true;
+  }
+  return {
+    input,
+    summary,
+    truncated,
+    estimatedTokens: estimateTokens(input),
+    callMarkers: observeCallMarkers(messages)
+  };
+}
+
+function flattenMessagesToInput(messages, options = {}) {
+  return buildSafeHistoryInput(messages, options).input;
+}
+
+function deriveForkConversationKey(sourceKey, requestId, prefixHash) {
+  const req = requestId || `fork_${Date.now()}`;
+  const hash = String(prefixHash || 'none').slice(0, 16);
+  return `${sourceKey}:fork:${req}:${hash}`;
+}
+
+function classifyPrefixMismatch(stored, msgs) {
+  const transcript = parseTranscript(stored);
+  const lastUser = lastUserMessage(msgs);
+  const lastUserText = textOfMessage(lastUser);
+  const storedUsers = transcript.filter((turn) => turn.role === 'user').map((turn) => String(turn.text || ''));
+
+  if (lastUserText && storedUsers.length >= 2) {
+    const earlier = storedUsers.slice(0, -1);
+    if (earlier.includes(lastUserText) && lastUserText !== storedUsers[storedUsers.length - 1]) {
+      return 'replayed_old_message';
+    }
+  }
+
+  const currentCount = (msgs || []).filter((message) => message && message.role !== 'system').length;
+  if (transcript.length > 0 && currentCount < transcript.length) {
+    const lastAssistant = [...transcript].reverse().find((turn) => turn.role === 'assistant');
+    const currentAssistantTexts = (msgs || []).filter((message) => message.role === 'assistant').map(textOfMessage);
+    const hasLastAssistant = lastAssistant?.text
+      && currentAssistantTexts.some((text) => text && String(text).includes(String(lastAssistant.text).slice(0, 80)));
+    if (!hasLastAssistant) return 'truncated_history';
+    return 'compressed_context_not_verifiable';
+  }
+
+  return 'prefix_mismatch';
+}
+
+function withConversationMeta(conversation, extra = {}) {
+  const mode = extra.mode || conversation.mode;
+  const sourceKey = extra.sourceConversationKey || conversation.sourceConversationKey || conversation.conversationKey;
+  return {
+    ...conversation,
+    ...extra,
+    mode,
+    conversationMode: extra.conversationMode || extra.mode || conversation.conversationMode || mode,
+    sourceConversationKey: sourceKey,
+    targetConversationKey: extra.targetConversationKey
+      || conversation.targetConversationKey
+      || conversation.conversationKey,
+    upstreamTransition: extra.upstreamTransition || conversation.upstreamTransition || 'none',
+    contextRebuildReason: extra.contextRebuildReason !== undefined
+      ? extra.contextRebuildReason
+      : (conversation.contextRebuildReason || null),
+    forkReason: extra.forkReason !== undefined ? extra.forkReason : (conversation.forkReason || null)
+  };
+}
+
+function resolveStoredConversation(database, tokenId, sourceKey, messages) {
+  if (!database || typeof database.listGatewayConversationsForSource !== 'function') {
+    return database?.getGatewayConversation?.(tokenId, sourceKey) || null;
+  }
+  const rows = database.listGatewayConversationsForSource(tokenId, sourceKey);
+  if (!rows.length) return null;
+  const msgs = Array.isArray(messages) ? messages : [];
+  const toolMessages = trailingToolMessages(msgs);
+  const isToolTurn = toolMessages.length > 0;
+  const prefix = isToolTurn ? msgs.slice(0, msgs.length - toolMessages.length) : msgs.slice(0, -1);
+  const prefixHash = hashNonAssistant(prefix);
+  const exact = rows.find((row) => row.prefix_hash === prefixHash);
+  if (exact) return exact;
+
+  const withoutSystem = msgs.filter((message) => message?.role !== 'system');
+  const prefixWithoutSystem = isToolTurn
+    ? withoutSystem.slice(0, withoutSystem.length - toolMessages.length)
+    : withoutSystem.slice(0, -1);
+  const altHash = hashNonAssistant(prefixWithoutSystem);
+  const sysMatch = rows.find((row) => row.prefix_hash === altHash);
+  if (sysMatch) return sysMatch;
+  return rows.find((row) => row.conversation_key === sourceKey) || rows[0] || null;
 }
 
 function lastUserMessage(messages) {
@@ -254,7 +490,16 @@ function toFunctionResult(message, resolveCallId) {
   };
 }
 
-function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = null, resolveCallId }) {
+function buildOpenAIConversation({
+  messages,
+  headers = {},
+  body = {},
+  stored = null,
+  resolveCallId,
+  requestId,
+  sourceConversationKey,
+  maxInputTokens
+} = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
   const stateless = headerFlag(headers, 'x-ag-stateless') || body.store === false;
   const reuseEnv = headerFlag(headers, 'x-ag-reuse-environment');
@@ -263,20 +508,25 @@ function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = n
     .map(textOfMessage)
     .filter(Boolean)
     .join('\n') || undefined;
-  const conversationKey = conversationKeyFrom({ messages: msgs, headers, body });
+  const lookupKey = sourceConversationKey || conversationKeyFrom({ messages: msgs, headers, body });
+  const storedKey = stored?.conversation_key || lookupKey;
   const nextPrefixHash = hashNonAssistant(msgs);
+  const callMarkers = observeCallMarkers(msgs);
 
   if (stateless) {
-    return {
-      input: flattenMessagesToInput(msgs),
+    const rebuilt = buildSafeHistoryInput(msgs, { kind: 'history', maxInputTokens });
+    return withConversationMeta({
+      input: rebuilt.input,
       environment: reuseEnv && stored?.environment_id ? stored.environment_id : 'remote',
       previousInteractionId: undefined,
       systemInstruction,
-      conversationKey,
+      conversationKey: lookupKey,
       nextPrefixHash,
       mode: 'stateless',
-      upstreamKeyId: stored?.upstream_key_id || null
-    };
+      upstreamKeyId: stored?.upstream_key_id || null,
+      toolTraceStatus: rebuilt.summary.toolTraceStatus,
+      callMarkers
+    }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
   const toolMessages = trailingToolMessages(msgs);
@@ -293,16 +543,19 @@ function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = n
   const isMultiTurn = withoutSystem.length > 1;
 
   if (!stored) {
-    return {
-      input: isMultiTurn ? flattenMessagesToInput(msgs) : input,
+    const rebuilt = isMultiTurn ? buildSafeHistoryInput(msgs, { kind: 'history', maxInputTokens }) : null;
+    return withConversationMeta({
+      input: rebuilt ? rebuilt.input : input,
       environment: 'remote',
       previousInteractionId: undefined,
       systemInstruction,
-      conversationKey,
+      conversationKey: lookupKey,
       nextPrefixHash,
       mode: 'new',
-      upstreamKeyId: null
-    };
+      upstreamKeyId: null,
+      toolTraceStatus: rebuilt?.summary.toolTraceStatus || 'none',
+      callMarkers
+    }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
   if (stored.prefix_hash !== prefixHash) {
@@ -312,40 +565,51 @@ function buildOpenAIConversation({ messages, headers = {}, body = {}, stored = n
     const storedWithoutSystem = hashNonAssistant(prefixWithoutSystem);
 
     if (storedWithoutSystem === stored.prefix_hash && stored.interaction_id) {
-      return {
+      return withConversationMeta({
         input,
         environment: stored.environment_id || 'remote',
         previousInteractionId: stored.interaction_id,
         systemInstruction,
-        conversationKey,
+        conversationKey: storedKey,
         nextPrefixHash,
         mode: 'continue',
-        upstreamKeyId: stored.upstream_key_id || null
-      };
+        upstreamKeyId: stored.upstream_key_id || null,
+        callMarkers
+      }, { sourceConversationKey: lookupKey, targetConversationKey: storedKey });
     }
 
-    return {
-      input: isMultiTurn ? flattenMessagesToInput(msgs) : openaiMessageToInputParts(lastUserMessage(msgs) || last),
+    const forkReason = classifyPrefixMismatch(stored, msgs);
+    const targetConversationKey = deriveForkConversationKey(lookupKey, requestId, nextPrefixHash);
+    const rebuilt = buildSafeHistoryInput(msgs, { kind: 'history', maxInputTokens });
+    return withConversationMeta({
+      input: isMultiTurn ? rebuilt.input : openaiMessageToInputParts(lastUserMessage(msgs) || last),
       environment: reuseEnv && stored.environment_id ? stored.environment_id : 'remote',
       previousInteractionId: undefined,
       systemInstruction,
-      conversationKey,
+      conversationKey: lookupKey,
       nextPrefixHash,
       mode: 'fork',
-      upstreamKeyId: stored.upstream_key_id || null
-    };
+      upstreamKeyId: stored.upstream_key_id || null,
+      toolTraceStatus: rebuilt.summary.toolTraceStatus,
+      callMarkers
+    }, {
+      sourceConversationKey: lookupKey,
+      targetConversationKey,
+      forkReason
+    });
   }
 
-  return {
+  return withConversationMeta({
     input,
     environment: stored.environment_id || 'remote',
     previousInteractionId: stored.interaction_id,
     systemInstruction,
-    conversationKey,
+    conversationKey: storedKey,
     nextPrefixHash,
     mode: 'continue',
-    upstreamKeyId: stored.upstream_key_id || null
-  };
+    upstreamKeyId: stored.upstream_key_id || null,
+    callMarkers
+  }, { sourceConversationKey: lookupKey, targetConversationKey: storedKey });
 }
 
 function mapOpenAITool(tool) {
@@ -549,7 +813,7 @@ function buildResponsesConversation({ body = {}, headers = {}, stored = null }) 
   const systemInstruction = typeof body.instructions === 'string' ? body.instructions : undefined;
 
   if (body.previous_response_id && stored) {
-    return {
+    return withConversationMeta({
       input,
       environment: stored.environment_id || 'remote',
       previousInteractionId: stored.interaction_id || body.previous_response_id,
@@ -558,19 +822,24 @@ function buildResponsesConversation({ body = {}, headers = {}, stored = null }) 
       nextPrefixHash: sha256(typeof input === 'string' ? input : JSON.stringify(input)),
       mode: 'continue',
       upstreamKeyId: stored.upstream_key_id || null
-    };
+    });
   }
 
-  return {
+  const mode = stored ? 'fork' : 'new';
+  const targetConversationKey = mode === 'fork'
+    ? deriveForkConversationKey(conversationKey, headers['x-request-id'], sha256(typeof input === 'string' ? input : JSON.stringify(input)))
+    : conversationKey;
+  return withConversationMeta({
     input,
     environment: reuseEnv && stored?.environment_id ? stored.environment_id : 'remote',
     previousInteractionId: undefined,
     systemInstruction,
     conversationKey,
     nextPrefixHash: sha256(typeof input === 'string' ? input : JSON.stringify(input)),
-    mode: stored ? 'fork' : 'new',
-    upstreamKeyId: stored?.upstream_key_id || null
-  };
+    mode,
+    upstreamKeyId: stored?.upstream_key_id || null,
+    forkReason: mode === 'fork' ? 'prefix_mismatch' : null
+  }, { sourceConversationKey: conversationKey, targetConversationKey });
 }
 
 function toResponsesResult({ data, requestedModel }) {
@@ -660,7 +929,7 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
   const reuseEnv = headerFlag(headers, 'x-ag-reuse-environment');
 
   if (!stored) {
-    return {
+    return withConversationMeta({
       input: contents.length > 1 ? flattenGeminiContents(contents) : input,
       environment: 'remote',
       previousInteractionId: undefined,
@@ -669,10 +938,11 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
       nextPrefixHash,
       mode: 'new',
       upstreamKeyId: null
-    };
+    });
   }
   if (stored.prefix_hash !== prefixHash) {
-    return {
+    const targetConversationKey = deriveForkConversationKey(conversationKey, headers['x-request-id'], nextPrefixHash);
+    return withConversationMeta({
       input: contents.length > 1 ? flattenGeminiContents(contents) : input,
       environment: reuseEnv && stored.environment_id ? stored.environment_id : 'remote',
       previousInteractionId: undefined,
@@ -680,19 +950,20 @@ function buildGeminiConversation({ body = {}, headers = {}, stored = null }) {
       conversationKey,
       nextPrefixHash,
       mode: 'fork',
-      upstreamKeyId: stored.upstream_key_id || null
-    };
+      upstreamKeyId: stored.upstream_key_id || null,
+      forkReason: 'prefix_mismatch'
+    }, { sourceConversationKey: conversationKey, targetConversationKey });
   }
-  return {
+  return withConversationMeta({
     input,
     environment: stored.environment_id || 'remote',
     previousInteractionId: stored.interaction_id,
     systemInstruction,
-    conversationKey,
+    conversationKey: stored.conversation_key || conversationKey,
     nextPrefixHash,
     mode: 'continue',
     upstreamKeyId: stored.upstream_key_id || null
-  };
+  }, { sourceConversationKey: conversationKey, targetConversationKey: stored.conversation_key || conversationKey });
 }
 
 function geminiToolsFromBody(body, tokenConfig = {}) {
@@ -769,6 +1040,19 @@ function parseTranscript(stored) {
   }
 }
 
+function isDuplicateCompletedTurn(messages, stored) {
+  if (!stored?.prefix_hash) return false;
+  return hashNonAssistant(messages) === stored.prefix_hash;
+}
+
+function lastAssistantFromTranscript(stored) {
+  const turns = parseTranscript(stored);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i]?.role === 'assistant' && turns[i].text) return String(turns[i].text);
+  }
+  return '';
+}
+
 function flattenGeminiContents(contents) {
   const messages = (contents || []).map((item) => ({
     role: item?.role === 'model' ? 'assistant' : (item?.role || 'user'),
@@ -806,65 +1090,79 @@ function withMigrationPreamble(input) {
   return input;
 }
 
-function migrateConversationForKeyChange(conversation, source = {}) {
+function migrateConversationForKeyChange(conversation, source = {}, options = {}) {
   const { messages, contents, stored } = source;
-
-  // Detect if the current input contains function_result items.
-  // If so, we must preserve their structure and provide task recovery context
-  // instead of blindly flattening everything to plain text.
+  const maxInputTokens = Number(options.maxInputTokens) > 0 ? Number(options.maxInputTokens) : 24000;
   const currentInput = conversation.input;
   const hasFunctionResults = Array.isArray(currentInput)
     && currentInput.some((item) => item && item.type === 'function_result');
+  const functionResults = hasFunctionResults
+    ? currentInput.filter((item) => item && item.type === 'function_result')
+    : [];
 
-  if (hasFunctionResults) {
-    // Build a recovery context that explains the situation to the model,
-    // while preserving the function_result items with their call_id intact.
-    const recoveryParts = [
-      { type: 'text', text: MIGRATION_NOTE },
-      { type: 'text', text: buildToolRecoveryContext(currentInput, source) }
-    ];
-
-    // Include the original function_result items with full structure preserved
-    for (const item of currentInput) {
-      if (item && item.type === 'function_result') {
-        recoveryParts.push(item);
-      }
-    }
-
-    return {
-      ...conversation,
-      input: recoveryParts,
-      environment: 'remote',
-      previousInteractionId: undefined,
-      mode: 'migrate',
-      upstreamKeyId: null
+  let rebuilt;
+  if (Array.isArray(messages) && messages.length > 0) {
+    rebuilt = buildSafeHistoryInput(messages, {
+      kind: 'migrate',
+      maxInputTokens,
+      preamble: MIGRATION_NOTE,
+      extraParts: functionResults
+    });
+  } else if (Array.isArray(contents) && contents.length > 0) {
+    rebuilt = {
+      input: withMigrationPreamble(flattenGeminiContents(contents)),
+      summary: summarizeToolHistory([]),
+      truncated: false,
+      estimatedTokens: 0,
+      callMarkers: observeCallMarkers(contents)
+    };
+  } else {
+    const transcript = parseTranscript(stored);
+    const input = transcript.length > 0
+      ? withMigrationPreamble(transcriptToInput(transcript, hasFunctionResults ? undefined : conversation.input))
+      : withMigrationPreamble(conversation.input);
+    rebuilt = {
+      input: hasFunctionResults
+        ? (Array.isArray(input) ? [...input, ...functionResults] : [{ type: 'text', text: input }, ...functionResults])
+        : input,
+      summary: summarizeToolHistory([]),
+      truncated: false,
+      estimatedTokens: estimateTokens(input),
+      callMarkers: observeCallMarkers(conversation.input)
     };
   }
 
-  // Non-tool-result migration: use messages / contents or transcript
-  let input;
-  const transcript = parseTranscript(stored);
-  if (Array.isArray(messages) && messages.length > 1) {
-    input = flattenMessagesToInput(messages);
-  } else if (Array.isArray(contents) && contents.length > 1) {
-    input = flattenGeminiContents(contents);
-  } else if (transcript.length > 0) {
-    input = transcriptToInput(transcript, conversation.input);
-  } else if (Array.isArray(messages) && messages.length > 0) {
-    input = flattenMessagesToInput(messages);
-  } else if (Array.isArray(contents) && contents.length > 0) {
-    input = flattenGeminiContents(contents);
-  } else {
-    input = conversation.input;
+  if (hasFunctionResults) {
+    const recoveryText = buildToolRecoveryContext(currentInput, source, { maxInputTokens });
+    const parts = [
+      { type: 'text', text: MIGRATION_NOTE },
+      { type: 'text', text: recoveryText },
+      ...functionResults
+    ];
+    rebuilt = {
+      ...rebuilt,
+      input: parts,
+      estimatedTokens: estimateTokens(parts)
+    };
   }
-  return {
+
+  return withConversationMeta({
     ...conversation,
-    input: withMigrationPreamble(input),
+    input: rebuilt.input,
     environment: 'remote',
     previousInteractionId: undefined,
     mode: 'migrate',
-    upstreamKeyId: null
-  };
+    rebuildMode: 'migrate',
+    upstreamKeyId: null,
+    migrationTruncated: Boolean(rebuilt.truncated),
+    migrationInputTokensEstimated: rebuilt.estimatedTokens,
+    toolTraceStatus: rebuilt.summary?.toolTraceStatus || conversation.toolTraceStatus || 'none',
+    callMarkers: rebuilt.callMarkers || conversation.callMarkers
+  }, {
+    upstreamTransition: 'frok',
+    sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
+    targetConversationKey: conversation.targetConversationKey || conversation.conversationKey
+  });
 }
 
 /**
@@ -874,18 +1172,21 @@ function migrateConversationForKeyChange(conversation, source = {}) {
  * @param {object} source - 原始请求源数据
  * @returns {string} 恢复上下文文本
  */
-function buildToolRecoveryContext(input, source = {}) {
+function buildToolRecoveryContext(input, source = {}, options = {}) {
   const results = (input || []).filter((item) => item && item.type === 'function_result');
+  const maxInputTokens = Number(options.maxInputTokens) > 0 ? Number(options.maxInputTokens) : 24000;
   const historyParts = [];
+  let summaryBlock = '';
 
   if (Array.isArray(source.messages) && source.messages.length > 0) {
-    const nonToolMsgs = source.messages.filter((m) => m.role !== 'tool' && m.role !== 'function');
-    const flattened = flattenMessagesToInput(nonToolMsgs);
+    const rebuilt = buildSafeHistoryInput(source.messages, { kind: 'history', maxInputTokens });
+    summaryBlock = formatToolSummaryBlock(rebuilt.summary);
+    const flattened = rebuilt.input;
     if (typeof flattened === 'string' && flattened.trim()) {
       historyParts.push(flattened);
     } else if (Array.isArray(flattened)) {
       for (const part of flattened) {
-        if (part.type === 'text' && part.text) historyParts.push(part.text);
+        if (part.type === 'text' && part.text && part.text !== summaryBlock) historyParts.push(part.text);
       }
     }
   } else if (Array.isArray(source.contents) && source.contents.length > 0) {
@@ -901,17 +1202,21 @@ function buildToolRecoveryContext(input, source = {}) {
     const transcript = parseTranscript(source.stored);
     for (const turn of transcript) {
       const role = turn.role === 'assistant' ? 'Assistant' : 'User';
-      const text = String(turn.text || '');
+      const text = stripFakeToolTrace(String(turn.text || ''));
       if (text) historyParts.push(`${role}: ${text}`);
     }
   }
 
   const parts = [];
   parts.push('This is a task continuation after an API key rotation. The previous interaction chain is no longer accessible.');
+  if (summaryBlock) {
+    parts.push('');
+    parts.push(summaryBlock);
+  }
 
   if (historyParts.length) {
     parts.push('');
-    parts.push('Complete conversation history:');
+    parts.push('Conversation history (reference only):');
     parts.push(historyParts.join('\n\n'));
   }
 
@@ -919,12 +1224,12 @@ function buildToolRecoveryContext(input, source = {}) {
   parts.push(`The previous interaction requested ${results.length} tool call(s). The tool(s) have been executed and their results follow as function_result items.`);
   for (const result of results) {
     const preview = Array.isArray(result.result)
-      ? result.result.map((r) => String(r.text || '')).join('; ')
+      ? truncateText(redactSensitive(result.result.map((item) => String(item.text || '')).join('; ')), 400)
       : '(no preview)';
     parts.push(`  - Tool: ${result.name || 'unknown'}, call_id: ${result.call_id || 'unknown'}, result preview: ${preview}`);
   }
   parts.push('');
-  parts.push('Please process the tool results and continue the task. Do NOT re-execute the tools — they have already completed successfully.');
+  parts.push('Please process the tool results and continue the task. Do NOT re-execute the tools — they have already completed successfully. The history above is not a current tool call.');
 
   return parts.join('\n');
 }
@@ -983,9 +1288,17 @@ module.exports = {
   collectImageUrls,
   toOpenAIToolCalls,
   mapOpenAITool,
-  flattenMessagesToInput,
   flattenGeminiContents,
   migrateConversationForKeyChange,
   appendTranscript,
-  parseTranscript
+  parseTranscript,
+  summarizeToolHistory,
+  observeCallMarkers,
+  estimateTokens,
+  deriveForkConversationKey,
+  resolveStoredConversation,
+  buildSafeHistoryInput,
+  classifyPrefixMismatch,
+  isDuplicateCompletedTurn,
+  lastAssistantFromTranscript
 };

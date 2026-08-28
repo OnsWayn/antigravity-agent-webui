@@ -3,7 +3,7 @@ const { authenticateClient } = require('./auth');
 const { openaiError, geminiError, sendJson } = require('./errors');
 const { callInteractions } = require('./interactions');
 const { AGENT_ID, listGatewayModels, resolveModel } = require('./models');
-const { isRateLimitError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker } = require('./upstream');
+const { isRateLimitError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker, RequestCounter } = require('./upstream');
 const {
   applyStreamEvent,
   emitChatCompletionsFinish,
@@ -19,7 +19,6 @@ const {
   buildGeminiConversation,
   buildOpenAIConversation,
   buildResponsesConversation,
-  conversationKeyFrom,
   requireConversationKey,
   geminiToolsFromBody,
   mergeTools,
@@ -29,8 +28,15 @@ const {
   toChatCompletion,
   toGeminiGenerateContent,
   toResponsesResult,
-  usageFromInteraction
+  usageFromInteraction,
+  resolveStoredConversation,
+  observeCallMarkers,
+  isDuplicateCompletedTurn,
+  lastAssistantFromTranscript,
+  estimateTokens
 } = require('./translate');
+const { resolveGatewaySettings } = require('./settings');
+const { pacificDayKey, nextPacificMidnightMs } = require('./pacific-time');
 
 function sanitizeHeaders(headers = {}) {
   const safe = {};
@@ -65,7 +71,13 @@ function sanitizeForStorage(value, key = '') {
   return value;
 }
 
-function publicUpstreamKey(row) {
+function publicUpstreamKey(row, extras = {}) {
+  const now = extras.now != null ? Number(extras.now) : Date.now();
+  const today = pacificDayKey(now);
+  const rpdUsed = row.rpd_pacific_day === today ? Number(row.rpd_count || 0) : 0;
+  const rpmUsed = extras.requestCounter && typeof extras.requestCounter.getRpm === 'function'
+    ? extras.requestCounter.getRpm(row.id, now)
+    : Number(row.rpmUsed || 0);
   return {
     id: row.id,
     name: row.name,
@@ -75,8 +87,80 @@ function publicUpstreamKey(row) {
     failCount: Number(row.fail_count || 0),
     cooldownUntil: row.cooldown_until || null,
     lastUsedAt: row.last_used_at,
-    createdAt: row.created_at
+    createdAt: row.created_at,
+    rpmUsed,
+    rpdUsed,
+    rpdResetAt: nextPacificMidnightMs(now),
+    rpdDay: today
   };
+}
+
+function parseDiagnostics(value) {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function mergeRequestDiagnostics(database, requestId, patch = {}) {
+  if (!requestId || !database || typeof database.updateGatewayRequestLog !== 'function') return;
+  const existing = database.getGatewayRequestLog(requestId);
+  const current = parseDiagnostics(existing?.diagnostics_json);
+  database.updateGatewayRequestLog(requestId, {
+    diagnosticsJson: { ...current, ...patch }
+  });
+}
+
+function disconnectedError() {
+  const error = new Error('client disconnected');
+  error.code = 'client_disconnected';
+  error.status = 499;
+  return error;
+}
+
+function clientDisconnected(req) {
+  const socket = req?.socket || req?.connection;
+  return req?.aborted === true || socket?.destroyed === true;
+}
+
+function sleepAbortable(ms, req) {
+  const duration = Math.max(0, Number(ms) || 0);
+  return new Promise((resolve, reject) => {
+    if (duration <= 0) {
+      resolve();
+      return;
+    }
+    if (clientDisconnected(req)) {
+      reject(disconnectedError());
+      return;
+    }
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      if (ok) resolve();
+      else reject(disconnectedError());
+    };
+    const timer = setTimeout(() => finish(true), duration);
+    const poll = setInterval(() => {
+      if (clientDisconnected(req)) finish(false);
+    }, 20);
+  });
+}
+
+function estimateNeededTokens(database, conversation) {
+  const fromLog = database && typeof database.getLatestSuccessTotalTokens === 'function'
+    ? database.getLatestSuccessTotalTokens(conversation?.conversationKey)
+    : null;
+  if (Number.isFinite(fromLog) && fromLog > 0) return fromLog;
+  const estimated = estimateTokens(conversation?.input);
+  return Number.isFinite(estimated) && estimated > 0 ? estimated : 0;
 }
 
 function requireGatewayReady({ enabled, masterKey }) {
@@ -121,21 +205,58 @@ function buildPayload({ resolved, conversation, tools, stream }) {
   return payload;
 }
 
-function persistSuccess({ database, token, conversation, resolved, data, endpoint, startedAt, status = 200, upstreamKeyId, stored }) {
+function persistSuccess({ database, token, conversation, resolved, data, endpoint, startedAt, status = 200, upstreamKeyId, stored, logger, requestId }) {
   const usage = usageFromInteraction(data);
   if (usage.totalTokens > 0) database.addClientTokenUsage(token.id, usage.totalTokens);
-  if (conversation?.conversationKey) {
-    database.upsertGatewayConversation({
+  const mode = conversation?.mode;
+  const targetKey = conversation?.targetConversationKey || conversation?.conversationKey;
+  let persistenceDecision = 'skipped';
+  let persistenceConflict = false;
+
+  if (mode !== 'stateless' && targetKey) {
+    const isContinue = mode === 'continue' || conversation?.upstreamTransition === 'frok';
+    const cas = isContinue && stored && stored.conversation_key === targetKey
+      ? {
+        expectedInteractionId: stored.interaction_id || null,
+        expectedUpstreamKeyId: stored.upstream_key_id || null,
+        expectedEnvironmentId: stored.environment_id || null
+      }
+      : {};
+    const result = database.upsertGatewayConversation({
       tokenId: token.id,
-      conversationKey: conversation.conversationKey,
+      conversationKey: targetKey,
       interactionId: data.id,
       environmentId: data.environment_id || null,
       prefixHash: conversation.nextPrefixHash,
       model: resolved.backendModel,
       upstreamKeyId: upstreamKeyId || null,
-      transcript: appendTranscript(stored, conversation, extractOutputText(data))
+      transcript: appendTranscript(stored, conversation, extractOutputText(data)),
+      parentConversationKey: conversation.parentConversationKey || (mode === 'fork' ? conversation.sourceConversationKey : null),
+      parentInteractionId: conversation.parentInteractionId || null,
+      parentEnvironmentId: conversation.parentEnvironmentId || null,
+      parentUpstreamKeyId: conversation.parentUpstreamKeyId || null,
+      ...cas
     });
+    persistenceDecision = mode === 'fork' ? 'write_branch' : (conversation?.upstreamTransition === 'frok' ? 'update_trunk_after_frok' : 'update_trunk');
+    persistenceConflict = Boolean(result?.conflict);
+    if (persistenceConflict && logger) {
+      logger.logEvent('warn', 'persistence_conflict', {
+        requestId,
+        sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
+        targetConversationKey: targetKey,
+        expectedInteractionId: stored?.interaction_id || null
+      });
+    }
+    if (requestId) {
+      try {
+        mergeRequestDiagnostics(database, requestId, {
+          persistenceDecision,
+          persistenceConflict
+        });
+      } catch {}
+    }
   }
+
   database.insertUsageLog({
     tokenId: token.id,
     endpoint,
@@ -147,6 +268,7 @@ function persistSuccess({ database, token, conversation, resolved, data, endpoin
     status,
     durationMs: Date.now() - startedAt
   });
+  return { persistenceDecision, persistenceConflict };
 }
 
 function persistFailure({ database, token, resolved, endpoint, startedAt, error }) {
@@ -179,14 +301,204 @@ function createGatewayRouter(options = {}) {
     masterKey,
     enabled = process.env.GATEWAY_ENABLED !== 'false',
     enforceSessionHeader = process.env.GATEWAY_ENFORCE_SESSION_HEADER === 'true',
-    sessionLockTimeoutMs = 120000,
+    sessionLockTimeoutMs = 120000, // waiter wait cap; the holder is never timed out
     sessionQueueLimit = 3,
     log = () => {},
-    callUpstream = callInteractions
+    callUpstream = callInteractions,
+    tpmLimit,
+    tpmThresholdRatio,
+    tpmWindowMs,
+    migrationMaxInputTokens,
+    requestCounter: injectedRequestCounter
   } = options;
 
   const logger = createGatewayLogger(log);
-  const tpmTracker = new TpmTracker();
+  const requestCounter = injectedRequestCounter || new RequestCounter();
+  const tpmTracker = new TpmTracker({
+    onReserveExpired: (info) => logger.logEvent('warn', 'tpm_reserve_expired', info)
+  });
+
+  function currentSettings() {
+    const resolved = resolveGatewaySettings(database);
+    return {
+      tpmStrategy: resolved.tpmStrategy,
+      tpmLimit: tpmLimit != null ? Number(tpmLimit) : resolved.tpmLimit,
+      tpmThresholdRatio: tpmThresholdRatio != null ? Number(tpmThresholdRatio) : resolved.tpmThresholdRatio,
+      tpmWindowMs: tpmWindowMs != null ? Number(tpmWindowMs) : resolved.tpmWindowMs,
+      tpmPaceLimit: resolved.tpmPaceLimit,
+      tpmPaceMaxWaitMs: resolved.tpmPaceMaxWaitMs,
+      tpmPaceDelayMs: resolved.tpmPaceDelayMs,
+      tpmReserveTtlMs: resolved.tpmReserveTtlMs,
+      migrationMaxInputTokens: migrationMaxInputTokens != null ? Number(migrationMaxInputTokens) : resolved.migrationMaxInputTokens
+    };
+  }
+
+  function applyTpmSettings() {
+    const settings = currentSettings();
+    tpmTracker.configure({
+      limitTpm: settings.tpmLimit,
+      thresholdRatio: settings.tpmThresholdRatio,
+      windowMs: settings.tpmWindowMs,
+      reserveTtlMs: settings.tpmReserveTtlMs
+    });
+    requestCounter.configure({ windowMs: settings.tpmWindowMs });
+    return settings;
+  }
+
+  function noteUpstreamAttempt(keyId) {
+    requestCounter.recordRequest(keyId);
+    if (database && typeof database.incrementUpstreamKeyRequest === 'function') {
+      database.incrementUpstreamKeyRequest(keyId);
+    }
+  }
+
+  function settleTpmUsage(keyId, usageTokens, currentReserveId) {
+    if (currentReserveId) {
+      const committed = tpmTracker.commitReservation(currentReserveId, usageTokens);
+      if (!committed) tpmTracker.record(keyId, usageTokens);
+      return null;
+    }
+    tpmTracker.record(keyId, usageTokens);
+    return null;
+  }
+
+  async function applyPaceStrategy({
+    req,
+    res,
+    stream,
+    upstream,
+    conversation,
+    source,
+    settings,
+    requestId,
+    switchIndex
+  }) {
+    const stickyId = conversation.upstreamKeyId || source.stored?.upstream_key_id || null;
+    const stickyPace = settings.tpmStrategy === 'pace'
+      && switchIndex === 0
+      && stickyId
+      && upstream.row.id === stickyId;
+    if (!stickyPace) {
+      return {
+        upstream,
+        tpmAvoided: Boolean(upstream.tpmAvoided),
+        reserveId: null,
+        tpmPacingDecision: null,
+        tpmPaceWaitMs: 0
+      };
+    }
+
+    const needed = estimateNeededTokens(database, conversation);
+    const limit = settings.tpmPaceLimit;
+    const pickAlt = () => {
+      try {
+        const alt = pickUpstreamKey(database, masterKey, {
+          preferId: null,
+          excludeIds: [upstream.row.id],
+          tpmTracker,
+          strategy: 'pace',
+          tpmPaceLimit: limit,
+          needed
+        });
+        if (alt.row.id !== upstream.row.id) {
+          return { ...alt, tpmAvoided: true };
+        }
+      } catch {}
+      return { ...upstream, tpmAvoided: false };
+    };
+
+    const skipToFrok = (waitMs, decision) => {
+      logger.logEvent('info', 'tpm_pacing_skipped_frok', {
+        requestId,
+        waitMs: Number.isFinite(waitMs) ? waitMs : null,
+        needed,
+        recentUsage: tpmTracker.getRecentUsage(upstream.row.id),
+        tpmPaceLimit: limit,
+        upstreamKeyId: upstream.row.id,
+        tpmPacingDecision: decision
+      });
+      const next = pickAlt();
+      return {
+        upstream: next,
+        tpmAvoided: Boolean(next.tpmAvoided),
+        reserveId: null,
+        tpmPacingDecision: decision,
+        tpmPaceWaitMs: Number.isFinite(waitMs) ? waitMs : 0
+      };
+    };
+
+    const maxWait = Number(settings.tpmPaceMaxWaitMs);
+    let waitMs = tpmTracker.timeUntilFits(upstream.row.id, needed, { limitTpm: limit });
+    if (needed > limit || waitMs === Infinity) {
+      return skipToFrok(waitMs, 'frok_oversize');
+    }
+    if (!(waitMs <= maxWait)) {
+      return skipToFrok(waitMs, 'frok_timeout');
+    }
+
+    if (waitMs > 0) {
+      const sleepMs = Math.min(
+        waitMs + settings.tpmPaceDelayMs,
+        settings.tpmWindowMs + settings.tpmPaceDelayMs
+      );
+      logger.logEvent('info', 'tpm_pacing', {
+        requestId,
+        waitMs,
+        paceDelayMs: settings.tpmPaceDelayMs,
+        needed,
+        recentUsage: tpmTracker.getRecentUsage(upstream.row.id),
+        tpmPaceLimit: limit,
+        upstreamKeyId: upstream.row.id
+      });
+      if (stream) {
+        try { res.write(`: tpm_pacing wait_ms=${sleepMs}\n\n`); } catch {}
+      } else {
+        disableTimeouts(req, res);
+      }
+      await sleepAbortable(sleepMs, req);
+      waitMs = tpmTracker.timeUntilFits(upstream.row.id, needed, { limitTpm: limit });
+      if (needed > limit || waitMs === Infinity) {
+        return skipToFrok(waitMs, 'frok_oversize');
+      }
+      if (!(waitMs <= maxWait)) {
+        return skipToFrok(waitMs, 'frok_timeout');
+      }
+      if (waitMs > 0) {
+        const extraSleep = Math.min(
+          waitMs + settings.tpmPaceDelayMs,
+          settings.tpmWindowMs + settings.tpmPaceDelayMs
+        );
+        await sleepAbortable(extraSleep, req);
+      }
+    }
+
+    let reserveId = tpmTracker.tryReserve(upstream.row.id, needed, {
+      limitTpm: limit,
+      ttlMs: settings.tpmReserveTtlMs
+    });
+    if (!reserveId) {
+      waitMs = tpmTracker.timeUntilFits(upstream.row.id, needed, { limitTpm: limit });
+      if (waitMs === 0) {
+        reserveId = tpmTracker.tryReserve(upstream.row.id, needed, {
+          limitTpm: limit,
+          ttlMs: settings.tpmReserveTtlMs
+        });
+      }
+      if (!reserveId) {
+        return skipToFrok(waitMs, !(waitMs <= maxWait) ? 'frok_timeout' : 'frok_oversize');
+      }
+    }
+
+    return {
+      upstream,
+      tpmAvoided: false,
+      reserveId,
+      tpmPacingDecision: waitMs > 0 ? 'wait' : 'send',
+      tpmPaceWaitMs: waitMs > 0 ? waitMs : 0
+    };
+  }
+
+  applyTpmSettings();
   const lockManager = createSessionLockManager({
     defaultTimeoutMs: sessionLockTimeoutMs,
     defaultQueueLimit: sessionQueueLimit,
@@ -218,18 +530,143 @@ function createGatewayRouter(options = {}) {
     else sendJson(res, status, openaiError(status, error.message, error.code || 'upstream_error', 'api_error').body);
   }
 
-  function bindConversationToKey(conversation, upstream, source, { forceMigrate = false, requestId } = {}) {
+  function replayDuplicateCompletedTurn({
+    req,
+    res,
+    resolved,
+    stored,
+    messages,
+    requestId,
+    conversationKey,
+    endpoint = '/v1/chat/completions'
+  }) {
+    if (!isDuplicateCompletedTurn(messages, stored)) return false;
+
+    const token = req.gatewayToken;
+    const startedAt = Date.now();
+    const assistantText = lastAssistantFromTranscript(stored);
+    const stream = Boolean(req.body?.stream);
+
+    try {
+      database.insertGatewayRequestLog({
+        requestId,
+        tokenId: token?.id || null,
+        tokenName: token?.name || null,
+        endpoint,
+        protocol: 'openai',
+        downstreamRequestJson: sanitizeForStorage(req.body),
+        downstreamHeadersJson: sanitizeHeaders(req.headers),
+        conversationKey: conversationKey || stored.conversation_key || null,
+        conversationMode: 'continue',
+        previousInteractionId: stored.interaction_id || null,
+        responseInteractionId: stored.interaction_id || null,
+        responseEnvironmentId: stored.environment_id || null,
+        model: resolved.requested,
+        backendModel: resolved.backendModel,
+        stream,
+        status: assistantText ? 'success' : 'error',
+        errorCode: assistantText ? null : 'duplicate_turn',
+        errorMessage: assistantText ? null : 'Duplicate turn already completed; no transcript to replay',
+        durationMs: 0,
+        createdAt: startedAt,
+        upstreamTransition: 'replay',
+        diagnosticsJson: { duplicateTurnReplay: true }
+      });
+    } catch {}
+
+    if (!assistantText) {
+      logger.logEvent('warn', 'duplicate_turn_missing_transcript', {
+        requestId,
+        conversationKey: conversationKey || stored.conversation_key
+      });
+      sendJson(res, 409, openaiError(409, 'Duplicate turn already completed', 'duplicate_turn').body);
+      return true;
+    }
+
+    const data = {
+      id: stored.interaction_id,
+      environment_id: stored.environment_id,
+      status: 'completed',
+      output_text: assistantText
+    };
+    logger.logEvent('info', 'duplicate_turn_replayed', {
+      requestId,
+      conversationKey: conversationKey || stored.conversation_key,
+      interactionId: stored.interaction_id
+    });
+
+    if (stream) {
+      const stopHeartbeat = startSse(res);
+      const created = Math.floor(Date.now() / 1000);
+      const id = data.id || `chatcmpl_${Date.now()}`;
+      emitLiveChatDelta(res, {
+        id,
+        model: resolved.requested,
+        created,
+        text: assistantText
+      });
+      emitChatCompletionsFinish({
+        res,
+        data,
+        requestedModel: resolved.requested,
+        id,
+        created
+      });
+      stopHeartbeat();
+      res.end();
+      return true;
+    }
+
+    sendJson(res, 200, toChatCompletion({
+      data,
+      requestedModel: resolved.requested
+    }));
+    return true;
+  }
+
+  function bindConversationToKey(conversation, upstream, source, {
+    forceMigrate = false,
+    requestId,
+    rebuildReason,
+    maxInputTokens
+  } = {}) {
     const boundId = conversation.upstreamKeyId || source?.stored?.upstream_key_id;
     if (!forceMigrate && boundId && boundId === upstream.row.id) return conversation;
     if (!forceMigrate && !boundId) return conversation;
-    logger.logEvent('info', 'context_migration_started', {
+    const reason = rebuildReason || (forceMigrate ? 'rate_limit' : 'key_rotation');
+    logger.logEvent('info', 'key_rotation_started', {
       requestId,
       conversationKey: conversation.conversationKey,
+      sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
       fromKeyUpstreamId: boundId || null,
       toKeyUpstreamId: upstream.row.id,
-      forceMigrate
+      forceMigrate,
+      contextRebuildReason: reason
     });
-    return migrateConversationForKeyChange(conversation, source);
+    logger.logEvent('info', 'context_rebuild_started', {
+      requestId,
+      conversationKey: conversation.conversationKey,
+      contextRebuildReason: reason
+    });
+    const originalMode = conversation.mode;
+    const migrated = migrateConversationForKeyChange(conversation, source, { maxInputTokens });
+    return {
+      ...migrated,
+      mode: originalMode && originalMode !== 'migrate' ? originalMode : 'continue',
+      conversationMode: originalMode && originalMode !== 'migrate' ? originalMode : 'continue',
+      upstreamTransition: 'frok',
+      contextRebuildReason: reason,
+      sourceUpstreamKeyId: boundId || null,
+      parentConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
+      parentInteractionId: conversation.previousInteractionId || source?.stored?.interaction_id || null,
+      parentEnvironmentId: (conversation.environment && conversation.environment !== 'remote')
+        ? conversation.environment
+        : (source?.stored?.environment_id || null),
+      parentUpstreamKeyId: boundId || null,
+      sourcePreviousInteractionId: conversation.previousInteractionId || source?.stored?.interaction_id || null,
+      upstreamPreviousInteractionId: null,
+      targetConversationKey: conversation.targetConversationKey || conversation.conversationKey
+    };
   }
 
   async function runInteraction({
@@ -253,6 +690,8 @@ function createGatewayRouter(options = {}) {
     let stopHeartbeat = () => {};
     const created = Math.floor(Date.now() / 1000);
     const streamId = `chatcmpl_${Date.now()}`;
+    const settings = applyTpmSettings();
+    const callMarkers = conversation.callMarkers || observeCallMarkers(req.body);
 
     // Record initial request log
     try {
@@ -266,12 +705,24 @@ function createGatewayRouter(options = {}) {
         downstreamHeadersJson: sanitizeHeaders(req.headers),
         conversationKey: conversation.conversationKey || null,
         conversationMode: conversation.mode || null,
-        previousInteractionId: conversation.previousInteractionId || null,
+        previousInteractionId: conversation.previousInteractionId || conversation.sourcePreviousInteractionId || null,
         model: resolved.requested,
         backendModel: resolved.backendModel,
         stream: Boolean(stream),
         status: 'pending',
-        createdAt: startedAt
+        createdAt: startedAt,
+        upstreamTransition: conversation.upstreamTransition || 'none',
+        contextRebuildReason: conversation.contextRebuildReason || null,
+        forkReason: conversation.forkReason || null,
+        sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey || null,
+        targetConversationKey: conversation.targetConversationKey || conversation.conversationKey || null,
+        sourceUpstreamKeyId: conversation.sourceUpstreamKeyId || conversation.upstreamKeyId || null,
+        upstreamPreviousInteractionId: conversation.upstreamPreviousInteractionId !== undefined
+          ? conversation.upstreamPreviousInteractionId
+          : (conversation.previousInteractionId || null),
+        rawCallMarkerDetected: callMarkers.detected,
+        rawCallMarkerCount: callMarkers.count,
+        toolTraceStatus: conversation.toolTraceStatus || (callMarkers.suspectedModelGenerated ? 'suspected_model_generated' : 'none')
       });
     } catch {}
 
@@ -293,15 +744,67 @@ function createGatewayRouter(options = {}) {
     try {
       for (let switchIndex = 0; switchIndex < keyBudget; switchIndex++) {
         let upstream;
+        let reserveId = null;
         try {
           upstream = pickUpstreamKey(database, masterKey, {
             preferId: switchIndex === 0 ? (conversation.upstreamKeyId || source.stored?.upstream_key_id) : null,
             excludeIds,
-            tpmTracker
+            tpmTracker,
+            strategy: settings.tpmStrategy,
+            tpmPaceLimit: settings.tpmPaceLimit,
+            needed: estimateNeededTokens(database, conversation)
           });
         } catch (error) {
           lastError = error;
           break;
+        }
+
+        let tpmAvoided = Boolean(upstream.tpmAvoided);
+        let tpmPacingDecision = null;
+        let tpmPaceWaitMs = 0;
+        try {
+          const paced = await applyPaceStrategy({
+            req,
+            res,
+            stream,
+            upstream,
+            conversation,
+            source,
+            settings,
+            requestId,
+            switchIndex
+          });
+          upstream = paced.upstream;
+          tpmAvoided = Boolean(paced.tpmAvoided);
+          reserveId = paced.reserveId || null;
+          tpmPacingDecision = paced.tpmPacingDecision;
+          tpmPaceWaitMs = paced.tpmPaceWaitMs || 0;
+        } catch (error) {
+          if (reserveId) tpmTracker.cancelReservation(reserveId);
+          lastError = error;
+          if (error.code === 'client_disconnected') {
+            try {
+              database.updateGatewayRequestLog(requestId, {
+                status: 'error',
+                errorCode: 'client_disconnected',
+                errorMessage: error.message,
+                durationMs: Date.now() - startedAt
+              });
+            } catch {}
+            try { res.destroy(); } catch {}
+            return;
+          }
+          break;
+        }
+
+        if (tpmPacingDecision) {
+          try {
+            mergeRequestDiagnostics(database, requestId, {
+              tpmStrategy: settings.tpmStrategy,
+              tpmPaceWaitMs,
+              tpmPacingDecision
+            });
+          } catch {}
         }
 
         if (switchIndex > 0) {
@@ -312,14 +815,33 @@ function createGatewayRouter(options = {}) {
             newUpstreamKeyId: upstream.row.id
           });
         }
+        if (tpmAvoided) {
+          logger.logEvent('info', 'tpm_avoidance', {
+            requestId,
+            conversationKey: conversation.conversationKey,
+            avoidedUpstreamKeyId: conversation.upstreamKeyId || source.stored?.upstream_key_id || null,
+            selectedUpstreamKeyId: upstream.row.id,
+            tpmLimit: settings.tpmStrategy === 'pace' ? settings.tpmPaceLimit : settings.tpmLimit,
+            tpmThresholdRatio: settings.tpmThresholdRatio,
+            recentUsage: tpmTracker.getRecentUsage(conversation.upstreamKeyId || source.stored?.upstream_key_id)
+          });
+        }
 
         let conversationForCall = bindConversationToKey(
           conversation,
           upstream,
           source,
-          { forceMigrate: switchIndex > 0, requestId }
+          {
+            forceMigrate: switchIndex > 0,
+            requestId,
+            rebuildReason: switchIndex > 0
+              ? 'rate_limit'
+              : (tpmAvoided ? 'tpm_limit' : 'key_rotation'),
+            maxInputTokens: settings.migrationMaxInputTokens
+          }
         );
 
+        try {
         for (let attempt = 1; attempt <= RATE_LIMIT_TRIES_PER_KEY; attempt++) {
           const payload = buildPayload({ resolved, conversation: conversationForCall, tools, stream });
           try {
@@ -328,7 +850,17 @@ function createGatewayRouter(options = {}) {
               upstreamKeyName: upstream.row.name,
               keySwitchCount: switchIndex,
               retryCount: attempt - 1,
-              upstreamRequestJson: sanitizeForStorage(payload)
+              upstreamRequestJson: sanitizeForStorage(payload),
+              conversationMode: conversationForCall.mode || null,
+              upstreamTransition: conversationForCall.upstreamTransition || 'none',
+              contextRebuildReason: conversationForCall.contextRebuildReason || null,
+              forkReason: conversationForCall.forkReason || null,
+              sourceConversationKey: conversationForCall.sourceConversationKey || conversationForCall.conversationKey || null,
+              targetConversationKey: conversationForCall.targetConversationKey || conversationForCall.conversationKey || null,
+              sourceUpstreamKeyId: conversationForCall.sourceUpstreamKeyId || conversation.upstreamKeyId || null,
+              previousInteractionId: conversationForCall.sourcePreviousInteractionId || conversation.previousInteractionId || null,
+              upstreamPreviousInteractionId: conversationForCall.previousInteractionId || null,
+              toolTraceStatus: conversationForCall.toolTraceStatus || null
             });
           } catch {}
 
@@ -338,10 +870,15 @@ function createGatewayRouter(options = {}) {
             model: resolved.requested,
             backendModel: resolved.backendModel,
             mode: conversationForCall.mode,
+            conversationMode: conversationForCall.mode,
+            upstreamTransition: conversationForCall.upstreamTransition || 'none',
+            contextRebuildReason: conversationForCall.contextRebuildReason || null,
             stream,
             upstreamKey: upstream.row.id,
             attempt,
             conversationKey: conversationForCall.conversationKey,
+            sourceConversationKey: conversationForCall.sourceConversationKey,
+            targetConversationKey: conversationForCall.targetConversationKey,
             previousInteractionId: conversationForCall.previousInteractionId,
             environment: conversationForCall.environment
           });
@@ -349,6 +886,7 @@ function createGatewayRouter(options = {}) {
           try {
             if (stream) {
               let state = {};
+              noteUpstreamAttempt(upstream.row.id);
               const result = await callUpstream({
                 apiKey: upstream.apiKey,
                 payload,
@@ -382,7 +920,7 @@ function createGatewayRouter(options = {}) {
                 if (last?.id) data.id = last.id;
               }
               const usage = usageFromInteraction(data);
-              tpmTracker.record(upstream.row.id, usage.totalTokens);
+              reserveId = settleTpmUsage(upstream.row.id, usage.totalTokens, reserveId);
               persistSuccess({
                 database,
                 token,
@@ -392,7 +930,9 @@ function createGatewayRouter(options = {}) {
                 endpoint,
                 startedAt,
                 upstreamKeyId: upstream.row.id,
-                stored: source.stored
+                stored: source.stored,
+                logger,
+                requestId
               });
               database.markUpstreamKeyUsed(upstream.row.id);
               try {
@@ -417,12 +957,17 @@ function createGatewayRouter(options = {}) {
                 responseStatus: data.status,
                 stream: true
               });
-              if (conversationForCall.mode === 'migrate') {
-                logger.logEvent('info', 'context_migration_succeeded', {
+              if (conversationForCall.upstreamTransition === 'frok') {
+                logger.logEvent('info', 'context_rebuild_completed', {
                   requestId,
                   conversationKey: conversationForCall.conversationKey,
+                  sourceConversationKey: conversationForCall.sourceConversationKey,
+                  targetConversationKey: conversationForCall.targetConversationKey,
                   interactionId: data.id,
-                  environmentId: data.environment_id
+                  environmentId: data.environment_id,
+                  contextRebuildReason: conversationForCall.contextRebuildReason,
+                  conversationMode: conversationForCall.mode,
+                  upstreamTransition: 'frok'
                 });
               }
               if (protocol === 'openai') {
@@ -446,6 +991,7 @@ function createGatewayRouter(options = {}) {
               return;
             }
 
+            noteUpstreamAttempt(upstream.row.id);
             const data = await callUpstream({
               apiKey: upstream.apiKey,
               payload,
@@ -453,7 +999,7 @@ function createGatewayRouter(options = {}) {
               stream: false
             });
             const usage = usageFromInteraction(data);
-            tpmTracker.record(upstream.row.id, usage.totalTokens);
+            reserveId = settleTpmUsage(upstream.row.id, usage.totalTokens, reserveId);
             persistSuccess({
               database,
               token,
@@ -463,7 +1009,9 @@ function createGatewayRouter(options = {}) {
               endpoint,
               startedAt,
               upstreamKeyId: upstream.row.id,
-              stored: source.stored
+              stored: source.stored,
+              logger,
+              requestId
             });
             database.markUpstreamKeyUsed(upstream.row.id);
             try {
@@ -488,12 +1036,17 @@ function createGatewayRouter(options = {}) {
               responseStatus: data.status,
               stream: false
             });
-            if (conversationForCall.mode === 'migrate') {
-              logger.logEvent('info', 'context_migration_succeeded', {
+            if (conversationForCall.upstreamTransition === 'frok') {
+              logger.logEvent('info', 'context_rebuild_completed', {
                 requestId,
                 conversationKey: conversationForCall.conversationKey,
+                sourceConversationKey: conversationForCall.sourceConversationKey,
+                targetConversationKey: conversationForCall.targetConversationKey,
                 interactionId: data.id,
-                environmentId: data.environment_id
+                environmentId: data.environment_id,
+                contextRebuildReason: conversationForCall.contextRebuildReason,
+                conversationMode: conversationForCall.mode,
+                upstreamTransition: 'frok'
               });
             }
             if (protocol === 'openai') {
@@ -511,6 +1064,10 @@ function createGatewayRouter(options = {}) {
           } catch (error) {
             lastError = error;
             if (!isRateLimitError(error)) {
+              if (reserveId) {
+                tpmTracker.cancelReservation(reserveId);
+                reserveId = null;
+              }
               database.markUpstreamKeyUsed(upstream.row.id, { failed: true });
               persistFailure({ database, token, resolved, endpoint, startedAt, error });
               try {
@@ -563,8 +1120,18 @@ function createGatewayRouter(options = {}) {
 
             if (attempt < RATE_LIMIT_TRIES_PER_KEY) continue;
 
+            if (reserveId) {
+              tpmTracker.cancelReservation(reserveId);
+              reserveId = null;
+            }
             excludeIds.push(upstream.row.id);
             break;
+          }
+        }
+        } finally {
+          if (reserveId) {
+            tpmTracker.cancelReservation(reserveId);
+            reserveId = null;
           }
         }
       }
@@ -659,13 +1226,28 @@ function createGatewayRouter(options = {}) {
     }
 
     try {
-      const stored = database.getGatewayConversation(token.id, conversationKey);
+      const stored = resolveStoredConversation(database, token.id, conversationKey, req.body.messages);
+      if (replayDuplicateCompletedTurn({
+        req,
+        res,
+        resolved,
+        stored,
+        messages: req.body.messages,
+        requestId,
+        conversationKey,
+        endpoint: '/v1/chat/completions'
+      })) {
+        return;
+      }
       const conversation = buildOpenAIConversation({
         messages: req.body.messages,
         headers: req.headers,
         body: req.body,
         stored,
-        resolveCallId: (id) => database.resolveGoogleCallId(id)
+        resolveCallId: (id) => database.resolveGoogleCallId(id),
+        requestId,
+        sourceConversationKey: conversationKey,
+        maxInputTokens: currentSettings().migrationMaxInputTokens
       });
       const tools = mergeTools({ body: req.body, headers: req.headers, tokenConfig: token });
       await runInteraction({

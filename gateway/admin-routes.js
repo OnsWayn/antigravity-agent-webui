@@ -4,6 +4,7 @@ const { encryptSecret, generateClientToken, keySuffix } = require('./crypto');
 const { sendJson } = require('./errors');
 const { listGatewayModels } = require('./models');
 const { publicUpstreamKey } = require('./routes');
+const { resolveGatewaySettings, clampGatewaySettings, envGatewaySettings } = require('./settings');
 
 function publicToken(row) {
   let allowedModels = null;
@@ -31,13 +32,30 @@ function publicToken(row) {
   };
 }
 
+const SETTINGS_PATCH_KEYS = [
+  'tpmStrategy',
+  'tpmLimit',
+  'tpmThresholdRatio',
+  'tpmWindowMs',
+  'tpmPaceLimit',
+  'tpmPaceMaxWaitMs',
+  'tpmPaceDelayMs',
+  'tpmReserveTtlMs',
+  'migrationMaxInputTokens'
+];
+
 function createAdminRouter(options = {}) {
   const {
     database,
     masterKey,
     adminToken,
-    enabled = process.env.GATEWAY_ENABLED !== 'false'
+    enabled = process.env.GATEWAY_ENABLED !== 'false',
+    requestCounter
   } = options;
+
+  function mapUpstreamKey(row) {
+    return publicUpstreamKey(row, { requestCounter });
+  }
 
   const router = express.Router();
 
@@ -57,7 +75,8 @@ function createAdminRouter(options = {}) {
       adminConfigured: Boolean(adminToken),
       upstreamKeys: database.listUpstreamKeys().length,
       tokens: database.listClientTokens().length,
-      models: listGatewayModels().map((model) => model.id)
+      models: listGatewayModels().map((model) => model.id),
+      settings: resolveGatewaySettings(database)
     });
   });
 
@@ -66,7 +85,7 @@ function createAdminRouter(options = {}) {
   router.get('/keys', (req, res) => {
     sendJson(res, 200, {
       success: true,
-      keys: database.listUpstreamKeys().map(publicUpstreamKey)
+      keys: database.listUpstreamKeys().map(mapUpstreamKey)
     });
   });
 
@@ -87,7 +106,7 @@ function createAdminRouter(options = {}) {
       suffix: keySuffix(apiKey),
       proxyUrl: req.body?.proxyUrl || null
     });
-    sendJson(res, 201, { success: true, key: publicUpstreamKey(row) });
+    sendJson(res, 201, { success: true, key: mapUpstreamKey(row) });
   });
 
   router.patch('/keys/:id', (req, res) => {
@@ -108,7 +127,7 @@ function createAdminRouter(options = {}) {
     }
     const row = database.updateUpstreamKey(req.params.id, fields);
     if (!row) return sendJson(res, 404, { success: false, error: { code: 'not_found', message: 'Upstream key not found' } });
-    sendJson(res, 200, { success: true, key: publicUpstreamKey(row) });
+    sendJson(res, 200, { success: true, key: mapUpstreamKey(row) });
   });
 
   router.delete('/keys/:id', (req, res) => {
@@ -206,6 +225,34 @@ function createAdminRouter(options = {}) {
   router.delete('/logs', (req, res) => {
     const count = database.clearGatewayRequestLogs();
     sendJson(res, 200, { success: true, cleared: count });
+  });
+
+  router.get('/settings', (req, res) => {
+    sendJson(res, 200, {
+      success: true,
+      settings: resolveGatewaySettings(database),
+      defaults: envGatewaySettings()
+    });
+  });
+
+  router.patch('/settings', (req, res) => {
+    try {
+      const current = resolveGatewaySettings(database);
+      const patch = {};
+      for (const key of SETTINGS_PATCH_KEYS) {
+        if (req.body && Object.prototype.hasOwnProperty.call(req.body, key)) {
+          patch[key] = req.body[key];
+        }
+      }
+      const next = clampGatewaySettings(patch, current);
+      database.setGatewaySettings(next);
+      sendJson(res, 200, { success: true, settings: resolveGatewaySettings(database) });
+    } catch (error) {
+      sendJson(res, error.status || 400, {
+        success: false,
+        error: { code: error.code || 'invalid_settings', message: error.message }
+      });
+    }
   });
 
   return router;

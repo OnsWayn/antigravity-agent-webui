@@ -5,7 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { AppDatabase } = require('../database');
 const { encryptSecret, keySuffix } = require('../gateway/crypto');
-const { isRateLimitError, pickUpstreamKey, TpmTracker } = require('../gateway/upstream');
+const { isRateLimitError, pickUpstreamKey, TpmTracker, RequestCounter } = require('../gateway/upstream');
 
 function withDatabase(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-up-'));
@@ -97,5 +97,107 @@ test('TpmTracker tracks sliding window usage and pickUpstreamKey avoids keys nea
     tracker.record(a.id, 90000, now);
     const picked = pickUpstreamKey(database, master, { now, tpmTracker: tracker });
     assert.equal(picked.row.id, b.id); // key A is near limit, picked B
+  });
+});
+
+test('sticky preferId near configurable TPM limit yields another key', () => {
+  const tracker = new TpmTracker({ windowMs: 60000, limitTpm: 10000, thresholdRatio: 0.8 });
+  const now = 2000000;
+  withDatabase((database) => {
+    const master = 'm';
+    const a = insertKey(database, master, 'secret-a', 'A');
+    const b = insertKey(database, master, 'secret-b', 'B');
+    tracker.record(a.id, 9000, now);
+    const picked = pickUpstreamKey(database, master, {
+      preferId: a.id,
+      now,
+      tpmTracker: tracker
+    });
+    assert.equal(picked.row.id, b.id);
+    assert.equal(picked.tpmAvoided, true);
+  });
+});
+
+test('timeUntilFits uses strict less-than and waits for the oldest record to leave', () => {
+  const tracker = new TpmTracker({ windowMs: 60000, limitTpm: 100000 });
+  const now = 1_000_000;
+  tracker.record('k', 40000, now);
+  assert.equal(tracker.timeUntilFits('k', 50000, { now }), 0);
+
+  tracker.clear();
+  tracker.record('k', 50000, now);
+  const waitEqual = tracker.timeUntilFits('k', 50000, { now });
+  assert.ok(waitEqual > 0);
+  assert.equal(waitEqual, 60000);
+
+  tracker.clear();
+  tracker.record('k', 48000, now);
+  assert.equal(tracker.timeUntilFits('k', 52000, { now }), 60000);
+
+  assert.equal(tracker.timeUntilFits('k', 120000, { now }), Infinity);
+});
+
+test('tryReserve admits only one concurrent slot and TTL releases it', () => {
+  const expired = [];
+  const tracker = new TpmTracker({
+    windowMs: 60000,
+    limitTpm: 100000,
+    reserveTtlMs: 1000,
+    onReserveExpired: (info) => expired.push(info)
+  });
+  const first = tracker.tryReserve('k', 90000, { now: 0, ttlMs: 1000 });
+  assert.ok(first);
+  assert.equal(tracker.tryReserve('k', 20000, { now: 10 }), null);
+  assert.equal(tracker.getRecentUsage('k', 10), 90000);
+
+  assert.equal(tracker.getRecentUsage('k', 1001), 0);
+  assert.equal(expired.length, 1);
+  assert.equal(expired[0].reserveId, first);
+  const second = tracker.tryReserve('k', 90000, { now: 1001, ttlMs: 1000 });
+  assert.ok(second);
+});
+
+test('unexpired reservation still occupies the window for timeUntilFits', () => {
+  const tracker = new TpmTracker({ windowMs: 60000, limitTpm: 100000, reserveTtlMs: 60000 });
+  const now = 5_000;
+  assert.ok(tracker.tryReserve('k', 60000, { now, ttlMs: 60000 }));
+  assert.ok(tracker.timeUntilFits('k', 50000, { now: now + 100 }) > 0);
+  assert.equal(tracker.tryReserve('k', 50000, { now: now + 100 }), null);
+});
+
+test('commitReservation replaces the hold with actual usage', () => {
+  const tracker = new TpmTracker({ windowMs: 60000, limitTpm: 100000 });
+  const id = tracker.tryReserve('k', 40000, { now: 0 });
+  tracker.commitReservation(id, 42000, 10);
+  assert.equal(tracker.getRecentUsage('k', 10), 42000);
+});
+
+test('RequestCounter drops timestamps outside the sliding window', () => {
+  const counter = new RequestCounter({ windowMs: 60000 });
+  const now = 1_000_000;
+  counter.recordRequest('k', now);
+  counter.recordRequest('k', now + 1000);
+  counter.recordRequest('k', now + 2000);
+  assert.equal(counter.getRpm('k', now + 2000), 3);
+  assert.equal(counter.getRpm('k', now + 61000), 2);
+});
+
+test('pickUpstreamKey strategy=pace keeps a hot sticky key', () => {
+  const tracker = new TpmTracker({ windowMs: 60000, limitTpm: 10000, thresholdRatio: 0.8 });
+  const now = 3_000_000;
+  withDatabase((database) => {
+    const master = 'm';
+    const a = insertKey(database, master, 'secret-a', 'A');
+    insertKey(database, master, 'secret-b', 'B');
+    tracker.record(a.id, 9000, now);
+    const picked = pickUpstreamKey(database, master, {
+      preferId: a.id,
+      now,
+      tpmTracker: tracker,
+      strategy: 'pace',
+      tpmPaceLimit: 10000
+    });
+    assert.equal(picked.row.id, a.id);
+    assert.equal(picked.tpmAvoided, false);
   });
 });

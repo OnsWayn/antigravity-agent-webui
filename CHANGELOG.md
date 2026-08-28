@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.7.3] - 2026-08-28
+
+### Added
+
+- Per upstream key request counters: in-memory RPM (same sliding window as TPM) and persisted RPD that resets at `America/Los_Angeles` midnight, matching Google AI Studio. The WebUI key row shows this-minute / today counts and the next Pacific midnight in the local timezone.
+- TPM pacing strategy (`tpmStrategy=pace`): sticky conversations wait for the sliding window to strictly fit the next round (`usage + needed < tpmPaceLimit`) instead of immediately rotating. Wait timeout still falls back to the original frok rebuild.
+- TPM reservation TTL (`tpmReserveTtlMs`, default follows `tpmWindowMs`). Expired holds are pruned with `tpm_reserve_expired` so a missed `finally` cannot deadlock a key's budget.
+
+### Changed
+
+- WebUI TPM card is now a mutually exclusive strategy picker (immediate frok vs queue-and-wait). Pace fields: TPM window, max wait, extra delay, reservation TTL.
+
+## [1.7.2] - 2026-08-27
+
+### Fixed
+
+- Session lock timeout no longer steals the holder. Waiters that exceed `sessionLockTimeoutMs` get `429 session_busy`; the in-flight continue keeps the lock until it finishes. Non-owner `releaseLock` is ignored.
+- Identical OpenAI chat-completions retries (same messages fingerprint as the persisted turn) replay the last assistant transcript instead of sending a second Gemini `continue` on the same `previous_interaction_id`. This was AGW-2026-08-27-SESSION-LOCK-001: a 157s turn plus a 120s client retry double-wrote user JSON and left later replies one round behind.
+
+## [1.7.1] - 2026-08-27
+
+### Added
+
+- Configurable TPM rotation: `GATEWAY_TPM_LIMIT`, `GATEWAY_TPM_THRESHOLD_RATIO`, `GATEWAY_TPM_WINDOW_MS`, and `GATEWAY_MIGRATION_MAX_INPUT_TOKENS`, overridable at runtime via `GET/PATCH /api/gateway/settings` and the WebUI.
+- Conversation decision object with downstream `continue/new/fork` and upstream `frok` (key rotation rebuild). Forks write derived branch keys and no longer overwrite the trunk.
+- Safe tool-history summaries for key migration and history rebuild. `[Calls:]` is observed, not parsed or executed.
+
+### Changed
+
+- Sticky conversations near the TPM threshold now migrate to an idle key instead of remaining pinned.
+- `flattenMessagesToInput` no longer emits `[Calls:]` / `Tool result (` templates.
+
 ## [1.7.0] - 2026-08-25
 
 ### Added
