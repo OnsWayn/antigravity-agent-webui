@@ -1,12 +1,21 @@
 const express = require('express');
 const { authenticateAdmin } = require('./auth');
-const { encryptSecret, generateClientToken, keySuffix } = require('./crypto');
+const { decryptSecret, encryptSecret, generateClientToken, keySuffix } = require('./crypto');
 const { sendJson } = require('./errors');
 const { listGatewayModels } = require('./models');
 const { publicUpstreamKey } = require('./routes');
 const { resolveGatewaySettings, clampGatewaySettings, envGatewaySettings } = require('./settings');
 
-function publicToken(row) {
+function tryDecrypt(ciphertext, iv, tag, masterKey) {
+  if (!masterKey || !ciphertext || !iv || !tag) return null;
+  try {
+    return decryptSecret({ ciphertext, iv, tag }, masterKey);
+  } catch {
+    return null;
+  }
+}
+
+function publicToken(row, extras = {}) {
   let allowedModels = null;
   if (row.allowed_models) {
     try {
@@ -17,6 +26,7 @@ function publicToken(row) {
     id: row.id,
     name: row.name,
     tokenPrefix: row.token_prefix,
+    secret: tryDecrypt(row.token_ciphertext, row.token_iv, row.token_tag, extras.masterKey),
     quotaTokens: Number(row.quota_tokens),
     usedTokens: Number(row.used_tokens),
     rpm: row.rpm,
@@ -43,7 +53,8 @@ const SETTINGS_PATCH_KEYS = [
   'tpmReserveTtlMs',
   'migrationMaxInputTokens',
   'internalErrorRetryLimit',
-  'hashIgnorePrefixes'
+  'hashIgnorePrefixes',
+  'gatewayModels'
 ];
 
 function createAdminRouter(options = {}) {
@@ -56,7 +67,13 @@ function createAdminRouter(options = {}) {
   } = options;
 
   function mapUpstreamKey(row) {
-    return publicUpstreamKey(row, { requestCounter });
+    const pub = publicUpstreamKey(row, { requestCounter });
+    pub.apiKey = tryDecrypt(row.key_ciphertext, row.key_iv, row.key_tag, masterKey);
+    return pub;
+  }
+
+  function mapToken(row) {
+    return publicToken(row, { masterKey });
   }
 
   const router = express.Router();
@@ -70,6 +87,7 @@ function createAdminRouter(options = {}) {
   }
 
   router.get('/status', (req, res) => {
+    const settings = resolveGatewaySettings(database);
     sendJson(res, 200, {
       success: true,
       enabled,
@@ -77,8 +95,8 @@ function createAdminRouter(options = {}) {
       adminConfigured: Boolean(adminToken),
       upstreamKeys: database.listUpstreamKeys().length,
       tokens: database.listClientTokens().length,
-      models: listGatewayModels().map((model) => model.id),
-      settings: resolveGatewaySettings(database)
+      models: listGatewayModels({ catalog: settings.gatewayModels }).map((model) => model.id),
+      settings
     });
   });
 
@@ -143,16 +161,28 @@ function createAdminRouter(options = {}) {
   router.get('/tokens', (req, res) => {
     sendJson(res, 200, {
       success: true,
-      tokens: database.listClientTokens().map(publicToken)
+      tokens: database.listClientTokens().map(mapToken)
     });
   });
 
   router.post('/tokens', (req, res) => {
     const generated = generateClientToken();
+    let ciphertext;
+    let iv;
+    let tag;
+    if (masterKey) {
+      const encrypted = encryptSecret(generated.token, masterKey);
+      ciphertext = encrypted.ciphertext;
+      iv = encrypted.iv;
+      tag = encrypted.tag;
+    }
     const row = database.insertClientToken({
       name: req.body?.name,
       tokenHash: generated.tokenHash,
       tokenPrefix: generated.tokenPrefix,
+      ciphertext,
+      iv,
+      tag,
       quotaTokens: req.body?.quotaTokens,
       rpm: req.body?.rpm,
       expiresAt: req.body?.expiresAt,
@@ -164,7 +194,7 @@ function createAdminRouter(options = {}) {
     });
     sendJson(res, 201, {
       success: true,
-      token: publicToken(row),
+      token: mapToken(row),
       secret: generated.token
     });
   });
@@ -183,7 +213,7 @@ function createAdminRouter(options = {}) {
       toolUrlContext: req.body?.toolUrlContext !== undefined ? (req.body.toolUrlContext ? 1 : 0) : undefined
     });
     if (!row) return sendJson(res, 404, { success: false, error: { code: 'not_found', message: 'Token not found' } });
-    sendJson(res, 200, { success: true, token: publicToken(row) });
+    sendJson(res, 200, { success: true, token: mapToken(row) });
   });
 
   router.delete('/tokens/:id', (req, res) => {

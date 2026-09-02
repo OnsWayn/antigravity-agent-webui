@@ -196,9 +196,9 @@ test('chat completions, responses and gemini endpoints share Interactions payloa
 
     const models = await request(base, '/v1/models', { headers });
     assert.equal(models.status, 200);
-    assert.equal(models.json.data.some((item) => item.id === 'antigravity-preview-05-2026'), true);
-    assert.equal(models.json.data.some((item) => item.id === 'antigravity-preview-05-2026/gemini-3.7-flash'), true);
-    assert.equal(models.json.data.some((item) => item.id === 'gemini-3.7-flash'), false);
+    assert.equal(models.json.data.some((item) => item.id === 'gemini-3.7-flash'), true);
+    assert.equal(models.json.data.some((item) => item.id === 'antigravity-preview-05-2026'), false);
+    assert.equal(models.json.data.some((item) => item.id === 'antigravity-preview-05-2026/gemini-3.7-flash'), false);
 
     const admin = await request(base, '/api/gateway/usage', {
       headers: { Authorization: `Bearer ${adminToken}` }
@@ -489,6 +489,106 @@ test('admin settings expose and update TPM limits', async () => {
 
     const statusRes = await request(base, '/api/gateway/status');
     assert.equal(statusRes.json.settings.tpmLimit, 8000);
+    assert.ok(Array.isArray(getRes.json.settings.gatewayModels));
+    assert.equal(getRes.json.settings.gatewayModels.includes('gemini-3.7-flash'), true);
+  });
+});
+
+test('admin can list full upstream keys and persisted client tokens', async () => {
+  await withApp(async () => ({}), async ({ base, database, masterKey, adminToken }) => {
+    const encrypted = encryptSecret('AIzaSyVisibleKey999', masterKey);
+    database.insertUpstreamKey({
+      name: 'visible',
+      ciphertext: encrypted.ciphertext,
+      iv: encrypted.iv,
+      tag: encrypted.tag,
+      suffix: keySuffix('AIzaSyVisibleKey999')
+    });
+    const keysRes = await request(base, '/api/gateway/keys', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(keysRes.status, 200);
+    assert.equal(keysRes.json.keys[0].apiKey, 'AIzaSyVisibleKey999');
+
+    const created = await request(base, '/api/gateway/tokens', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { name: 'copy-me', quotaTokens: -1 }
+    });
+    assert.equal(created.status, 201);
+    assert.match(created.json.secret, /^ag-/);
+    const listed = await request(base, '/api/gateway/tokens', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(listed.json.tokens[0].secret, created.json.secret);
+  });
+});
+
+test('gateway model catalog is listed as-is and passed through to agent_config.model', async () => {
+  let captured = null;
+  await withApp(async ({ payload }) => {
+    captured = payload;
+    return {
+      id: 'int-catalog',
+      status: 'completed',
+      environment_id: 'env-catalog',
+      output_text: 'ok',
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'ok' }] }],
+      usage: { total_tokens: 1 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const patched = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { gatewayModels: ['gemini-3.8-flash', 'my-custom-model'] }
+    });
+    assert.equal(patched.status, 200);
+    assert.deepEqual(patched.json.settings.gatewayModels, ['gemini-3.8-flash', 'my-custom-model']);
+
+    const encrypted = encryptSecret('gemini-test-key', masterKey);
+    database.insertUpstreamKey({
+      name: 'test',
+      ciphertext: encrypted.ciphertext,
+      iv: encrypted.iv,
+      tag: encrypted.tag,
+      suffix: keySuffix('gemini-test-key')
+    });
+    const generated = generateClientToken();
+    database.insertClientToken({
+      name: 'client',
+      tokenHash: generated.tokenHash,
+      tokenPrefix: generated.tokenPrefix,
+      quotaTokens: -1
+    });
+    const headers = { Authorization: `Bearer ${generated.token}` };
+
+    const models = await request(base, '/v1/models', { headers });
+    assert.deepEqual(models.json.data.map((item) => item.id), ['gemini-3.8-flash', 'my-custom-model']);
+
+    const chat = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'gemini-3.8-flash',
+        messages: [{ role: 'user', content: 'ping' }]
+      }
+    });
+    assert.equal(chat.status, 200);
+    assert.equal(captured.agent_config.model, 'gemini-3.8-flash');
+
+    const pass = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'gemini-experimental-foo',
+        messages: [{ role: 'user', content: 'another-ping' }]
+      }
+    });
+    assert.equal(pass.status, 200);
+    assert.equal(captured.agent_config.model, 'gemini-experimental-foo');
+
+    const statusRes = await request(base, '/api/gateway/status');
+    assert.deepEqual(statusRes.json.models, ['gemini-3.8-flash', 'my-custom-model']);
   });
 });
 

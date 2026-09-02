@@ -251,12 +251,14 @@ class AppDatabase {
       this.createSchemaV5();
       this.createSchemaV6();
       this.createSchemaV7();
+      this.createSchemaV8();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(Date.now());
       return;
     }
 
@@ -285,6 +287,10 @@ class AppDatabase {
     this.createSchemaV7();
     if (version < 7) {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
+    }
+    this.createSchemaV8();
+    if (version < 8) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(Date.now());
     }
   }
 
@@ -397,6 +403,13 @@ class AppDatabase {
     if (!this.tableExists('upstream_keys')) return;
     this.ensureColumn('upstream_keys', 'rpd_pacific_day', 'TEXT');
     this.ensureColumn('upstream_keys', 'rpd_count', 'INTEGER NOT NULL DEFAULT 0');
+  }
+
+  createSchemaV8() {
+    if (!this.tableExists('client_tokens')) return;
+    this.ensureColumn('client_tokens', 'token_ciphertext', 'TEXT');
+    this.ensureColumn('client_tokens', 'token_iv', 'TEXT');
+    this.ensureColumn('client_tokens', 'token_tag', 'TEXT');
   }
 
   createSchemaV4() {
@@ -875,6 +888,9 @@ class AppDatabase {
     name,
     tokenHash,
     tokenPrefix,
+    ciphertext,
+    iv,
+    tag,
     quotaTokens,
     rpm,
     expiresAt,
@@ -889,16 +905,20 @@ class AppDatabase {
     const allowed = Array.isArray(allowedModels) ? json(allowedModels) : (allowedModels || null);
     this.db.prepare(`
       INSERT INTO client_tokens (
-        id, name, token_hash, token_prefix, quota_tokens, used_tokens,
+        id, name, token_hash, token_prefix, token_ciphertext, token_iv, token_tag,
+        quota_tokens, used_tokens,
         rpm, enabled, expires_at, allowed_models, default_model,
         tool_code_execution, tool_google_search, tool_url_context,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       tokenId,
       name || 'API Token',
       tokenHash,
       tokenPrefix,
+      ciphertext || null,
+      iv || null,
+      tag || null,
       Number.isFinite(quotaTokens) ? quotaTokens : -1,
       Number.isFinite(rpm) ? rpm : null,
       expiresAt || null,

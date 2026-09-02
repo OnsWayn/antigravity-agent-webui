@@ -457,7 +457,8 @@ function createGatewayRouter(options = {}) {
       tpmReserveTtlMs: resolved.tpmReserveTtlMs,
       migrationMaxInputTokens: migrationMaxInputTokens != null ? Number(migrationMaxInputTokens) : resolved.migrationMaxInputTokens,
       internalErrorRetryLimit: resolved.internalErrorRetryLimit,
-      hashIgnorePrefixes: Array.isArray(resolved.hashIgnorePrefixes) ? resolved.hashIgnorePrefixes : []
+      hashIgnorePrefixes: Array.isArray(resolved.hashIgnorePrefixes) ? resolved.hashIgnorePrefixes : [],
+      gatewayModels: Array.isArray(resolved.gatewayModels) ? resolved.gatewayModels : []
     };
   }
 
@@ -1487,9 +1488,12 @@ function createGatewayRouter(options = {}) {
     const token = authOrError(req, res, 'openai');
     if (!token) return;
     const allowed = token.allowed_models ? JSON.parse(token.allowed_models) : null;
-    let list = listGatewayModels();
+    let list = listGatewayModels({ catalog: currentSettings().gatewayModels });
     if (Array.isArray(allowed) && allowed.length > 0) {
-      list = list.filter((m) => allowed.includes(m.id) || (m.parent && allowed.includes(m.id.slice(m.parent.length + 1))));
+      list = list.filter((m) => (
+        allowed.includes(m.id)
+        || allowed.includes(`${AGENT_ID}/${m.id}`)
+      ));
     }
     sendJson(res, 200, { object: 'list', data: list });
   }

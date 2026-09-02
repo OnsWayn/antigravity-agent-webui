@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.7.5** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.7.6** · Node.js **22.5+** · License **Apache-2.0**
 
 > **免费档使用建议。** Gemini / Antigravity 免费层级大约只有 **100,000 TPM**，适合当作轻量聊天 API，不适合高并发或重度 Agent 循环。建议在下游 Token 上关闭沙盒三项内置工具（代码执行、谷歌搜索、网页抓取），把工具执行交给调用方自己的 Agent 框架。
 >
@@ -109,6 +109,7 @@ npm run dev
 | `GATEWAY_MIGRATION_MAX_INPUT_TOKENS` | `24000` | Key 轮换重建上下文时的估算 token 上限。 |
 | `GATEWAY_INTERNAL_ERROR_RETRY_LIMIT` | `2` | 同一会话连续命中 `Internal error encountered` 后熔断，后续请求 HTTP 400、不再打上游。 |
 | `GATEWAY_HASH_IGNORE_PREFIXES` | `["<RAG-Faiss-Memory>"]` | 算 `prefix_hash` 前剥离的字面量前缀。JSON 数组或换行分隔。 |
+| `GATEWAY_MODELS` | 四个 Flash 底层型号 | `/v1/models` 默认目录。JSON 数组或换行分隔。可在 WebUI 运行时覆盖，不必改代码。 |
 
 以上 TPM / 迁移项是启动默认值。WebUI「协议中转站」和 `GET/PATCH /api/gateway/settings` 可在运行时覆盖，不必重启。优先级：WebUI / 管理 API > 环境变量 > 代码默认。每把上游 Key 还会显示本分钟 RPM（内存）和今日 RPD（SQLite，洛杉矶午夜对齐 Google AI Studio）。
 
@@ -163,7 +164,7 @@ test -s /workspace/diagram.svg && ls -l /workspace/diagram.svg，确认文件存
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 网关（Antigravity 沙盒）。 |
 | `POST` | `/v1/responses` | OpenAI Responses 网关；`/v1/chat/responses` 为别名。 |
 | `POST` | `/v1beta/models/{model}:generateContent` | Gemini 请求外形，内部仍转发到 Interactions。 |
-| `GET` | `/v1/models` | 网关模型列表（agent 以及 4 个底层型号）。 |
+| `GET` | `/v1/models` | 网关模型目录（WebUI 里添加的名字，无 Antigravity 前缀）。 |
 
 创建任务时可以提交：
 
@@ -181,9 +182,9 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 ## 协议中转站
 
-在 `.env` 中设置 `GATEWAY_MASTER_KEY` 和 `GATEWAY_ADMIN_TOKEN`，重启后打开「协议中转站」面板。添加加密保存的上游 Gemini Key，再创建下游 `ag-` Token。其他应用只应使用该 Token，不要再传 Gemini Key。TPM 策略、限额、排队等待和迁移 input 预算也在同一面板修改。
+在 `.env` 中设置 `GATEWAY_MASTER_KEY` 和 `GATEWAY_ADMIN_TOKEN`，重启后打开「协议中转站」面板。添加加密保存的上游 Gemini Key（面板里一直显示、可复制），再创建下游 `ag-` Token（发行后也会一直显示、可复制）。其他应用只应使用该 Token，不要再传 Gemini Key。TPM 策略、限额、排队等待、迁移 input 预算和对外模型目录也在同一面板修改。
 
-网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。允许的 `agent_config.model`：`gemini-3.7-flash`、`gemini-3.6-flash`、`gemini-3.5-flash`、`gemini-3.5-flash-lite`。
+网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。下游请求里的 `model` 会原样写入 `agent_config.model`。Google 更新型号时，在「对外模型目录」里添加即可，不必改项目。
 
 可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 时，会把当前对话带到下一把 Key 上开**新沙盒**继续。默认 TPM 策略（`clone`，旧名 `frok`）在用量达到 `上限 × 比例` 时同样迁移。可选 `pace` 策略会钉住原 Key，等到 `已用量 + 本轮` 严格小于 TPM 窗口再发；预计等待超过 `tpmPaceMaxWaitMs` 仍 clone。本轮大小优先用该会话最近一次成功 `total_tokens`（含 fork 主干/分支 key），否则按视觉 token 估算 inline 图片（大约 1k–3k / 张，不再把 Base64 当 `chars/4`）。下游 `conversation_mode` 仍为 `continue`，上游记为 `clone`（Key 轮换重建），不是 `new`。工具历史以不可执行摘要迁移，不再生成 `[Calls:]` 模板，避免模型模仿假工具调用（旧沙盒里的文件带不过去）。
 
@@ -195,23 +196,24 @@ curl.exe http://localhost:3000/api/interactions/create `
 - **并发互斥锁**：同一 `x-session-id` 的并发请求会在服务端自动排队串行处理，防止旧请求覆盖新交互状态；超出排队上限时返回 HTTP 429 `session_busy`。
 - **全链路诊断日志**：每个请求分配唯一 `request_id`，自动脱敏 API Key、Authorization 头、超大图片 Base64 与系统指令。日志同时记录 `conversation_mode`（`continue` / `new` / `fork`）和 `upstream_transition`（`none` / `clone`）。模型文本中的 `[Calls:]` 只计数观测，不会被解析或执行。
 
-> **注意**：上述模型列表是在代码中硬编码的（`gateway/models.js` 和 `web/src/lib.js`）。Google 目前没有提供 API 来查询某个 managed agent 支持哪些 `agent_config.model` 值——标准的 `/v1beta/models` 接口只返回独立 Gemini 模型目录，不包含 Agent 内部引擎信息。如果 Google 将来新增或下线模型，需要手动更新这两个文件。
+> **注意**：Google 目前没有 API 查询 managed agent 支持哪些 `agent_config.model`。因此目录可在 WebUI 编辑（`PATCH /api/gateway/settings` 的 `gatewayModels`，或环境变量 `GATEWAY_MODELS`）。`/v1/models` 返回这些名字，没有 `antigravity-preview-05-2026/` 前缀。目录里没有的名字同样会透传到上游 `agent_config.model`。
 
 多轮对话使用服务端 `previous_interaction_id`。能证明连续时，回传的 `messages[]` 只用来计算本轮增量，不会整段再发一遍；无法验证的压缩或截断历史会 fork，而不是硬接旧链。支持图片；TPM / 迁移预算按图片尺寸估算（解析不了时按 2800 token），不用 Base64 长度。OpenAI `tools` 会变成自定义函数并由客户端执行；远程 MCP URL 可通过 `extra_body.mcp_servers` 传递。本机 stdio MCP 无法在 Google 沙盒里运行。
 
-网关**不会**列出该 API Key 名下的普通 Gemini 模型目录。它只提供 Antigravity Agent，以及这个 Agent 允许的 4 个 `agent_config.model`：
+网关**不会**列出该 API Key 名下的普通 Gemini 模型目录。`GET /v1/models` 返回你添加的名字（默认如下）。客户端应直接填这些名字，不要带 `antigravity-preview-05-2026/` 前缀：
 
-- `antigravity-preview-05-2026`（默认底层 `gemini-3.7-flash`）
-- `antigravity-preview-05-2026/gemini-3.7-flash`
-- `antigravity-preview-05-2026/gemini-3.6-flash`
-- `antigravity-preview-05-2026/gemini-3.5-flash`
-- `antigravity-preview-05-2026/gemini-3.5-flash-lite`
+- `gemini-3.7-flash`（请求未带 `model` 时的默认值）
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3.5-flash-lite`
+
+带前缀的旧写法如 `antigravity-preview-05-2026/gemini-3.7-flash` 仍然可用，发给上游前会去掉前缀。
 
 ```powershell
 curl.exe http://localhost:3000/v1/chat/completions `
   -H "Authorization: Bearer ag-YOUR_TOKEN" `
   -H "Content-Type: application/json" `
-  --data-raw '{"model":"antigravity-preview-05-2026/gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
+  --data-raw '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
 ```
 
 ## 数据与隐私

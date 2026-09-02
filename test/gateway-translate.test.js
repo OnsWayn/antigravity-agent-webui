@@ -249,16 +249,19 @@ test('resolveModel supports default backends and custom models', () => {
   assert.equal(resolveGatewayModel('gemini-3.7-flash', { allowedModels: ['gemini-3.7-flash'] }).ok, true);
 });
 
-test('model catalog only lists Antigravity agent ids, not the key Gemini catalog', () => {
+test('model catalog lists added names without the Antigravity prefix', () => {
   const { listGatewayModels } = require('../gateway/models');
   const ids = listGatewayModels().map((model) => model.id);
   assert.deepEqual(ids, [
-    'antigravity-preview-05-2026',
-    'antigravity-preview-05-2026/gemini-3.7-flash',
-    'antigravity-preview-05-2026/gemini-3.6-flash',
-    'antigravity-preview-05-2026/gemini-3.5-flash',
-    'antigravity-preview-05-2026/gemini-3.5-flash-lite'
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite'
   ]);
+  assert.deepEqual(
+    listGatewayModels({ catalog: ['gemini-3.8-flash', 'gemini-3.8-flash'] }).map((model) => model.id),
+    ['gemini-3.8-flash']
+  );
 });
 
 test('preserves multi-turn conversation and tool calls history on new and fork modes', () => {

@@ -1,3 +1,5 @@
+const { BACKEND_MODELS } = require('./models');
+
 const DEFAULT_GATEWAY_SETTINGS = {
   tpmStrategy: 'clone',
   tpmLimit: 100000,
@@ -8,7 +10,8 @@ const DEFAULT_GATEWAY_SETTINGS = {
   tpmPaceDelayMs: 5000,
   migrationMaxInputTokens: 24000,
   internalErrorRetryLimit: 2,
-  hashIgnorePrefixes: ['<RAG-Faiss-Memory>']
+  hashIgnorePrefixes: ['<RAG-Faiss-Memory>'],
+  gatewayModels: BACKEND_MODELS.slice()
 };
 
 function parsePositiveInt(value, fallback) {
@@ -89,6 +92,34 @@ function parsePrefixList(value, fallback = DEFAULT_GATEWAY_SETTINGS.hashIgnorePr
   return out;
 }
 
+function parseModelCatalog(value, fallback = DEFAULT_GATEWAY_SETTINGS.gatewayModels, { strict = false } = {}) {
+  if (value == null) return Array.isArray(fallback) ? fallback.slice() : [];
+  if (typeof value === 'string' && value.trim() === '') return [];
+  const source = splitPrefixSource(value);
+  if (!source) {
+    if (strict) throw invalidSettings('gatewayModels must be an array or newline-separated string');
+    return Array.isArray(fallback) ? fallback.slice() : [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (const item of source) {
+    const id = String(item == null ? '' : item).trim();
+    if (!id) continue;
+    if (id.length > 128) {
+      if (strict) throw invalidSettings('gatewayModels entries must be 1–128 characters');
+      continue;
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length > 64) {
+      if (strict) throw invalidSettings('gatewayModels supports at most 64 entries');
+      break;
+    }
+  }
+  return out;
+}
+
 function envGatewaySettings() {
   const tpmWindowMs = parsePositiveInt(process.env.GATEWAY_TPM_WINDOW_MS, DEFAULT_GATEWAY_SETTINGS.tpmWindowMs);
   const settings = {
@@ -110,6 +141,11 @@ function envGatewaySettings() {
     hashIgnorePrefixes: parsePrefixList(
       process.env.GATEWAY_HASH_IGNORE_PREFIXES,
       DEFAULT_GATEWAY_SETTINGS.hashIgnorePrefixes,
+      { strict: false }
+    ),
+    gatewayModels: parseModelCatalog(
+      process.env.GATEWAY_MODELS,
+      DEFAULT_GATEWAY_SETTINGS.gatewayModels,
       { strict: false }
     )
   };
@@ -148,6 +184,11 @@ function clampGatewaySettings(input = {}, fallback = DEFAULT_GATEWAY_SETTINGS) {
     fallback.hashIgnorePrefixes ?? DEFAULT_GATEWAY_SETTINGS.hashIgnorePrefixes,
     { strict: true }
   );
+  const gatewayModels = parseModelCatalog(
+    base.gatewayModels,
+    fallback.gatewayModels ?? DEFAULT_GATEWAY_SETTINGS.gatewayModels,
+    { strict: true }
+  );
 
   if (tpmLimit < 1000) throw invalidSettings('tpmLimit must be >= 1000');
   if (tpmThresholdRatio < 0.1 || tpmThresholdRatio > 1) throw invalidSettings('tpmThresholdRatio must be between 0.1 and 1');
@@ -168,7 +209,8 @@ function clampGatewaySettings(input = {}, fallback = DEFAULT_GATEWAY_SETTINGS) {
     tpmReserveTtlMs,
     migrationMaxInputTokens,
     internalErrorRetryLimit,
-    hashIgnorePrefixes
+    hashIgnorePrefixes,
+    gatewayModels
   };
 }
 
@@ -185,5 +227,6 @@ module.exports = {
   clampGatewaySettings,
   resolveGatewaySettings,
   parsePrefixList,
+  parseModelCatalog,
   parseStrategy
 };

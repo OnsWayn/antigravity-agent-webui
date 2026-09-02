@@ -362,6 +362,23 @@ test('Schema V5: client_tokens fine control columns and updates', () => {
   });
 });
 
+test('Schema V8: client tokens can persist encrypted plaintext for later display', () => {
+  withDatabase((database) => {
+    const token = database.insertClientToken({
+      name: 'Visible Token',
+      tokenHash: 'hash-vis',
+      tokenPrefix: 'ag-vis',
+      ciphertext: 'ct',
+      iv: 'iv',
+      tag: 'tag',
+      quotaTokens: -1
+    });
+    assert.equal(token.token_ciphertext, 'ct');
+    assert.equal(token.token_iv, 'iv');
+    assert.equal(token.token_tag, 'tag');
+  });
+});
+
 test('Schema V6: settings, parent fields and CAS conversation updates', () => {
   withDatabase((database) => {
     database.setGatewaySettings({

@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.7.6] - 2026-09-02
+
+### Added
+
+- Editable gateway model catalog (`gatewayModels` / `GATEWAY_MODELS`). Names added in the WebUI appear as-is on `/v1/models` with no `antigravity-preview-05-2026/` prefix. Google model updates no longer require a code change.
+- Admin APIs always return decrypted upstream Gemini keys and persisted downstream client tokens so they can be copied later. New tokens store an encrypted copy of the secret (schema v8). Tokens issued before 1.7.6 still show only a prefix.
+
+### Changed
+
+- Downstream `model` is written straight into upstream `agent_config.model`. Unknown names pass through; the old per-token “allowed models” UI is gone.
+- Protocol gateway panel no longer shows the recent usage overview.
+
 ## [1.7.5] - 2026-09-02
 
 ### Added

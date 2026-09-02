@@ -6,7 +6,7 @@ A high-performance **OpenAI / Gemini protocol gateway** and **management dashboa
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.7.5** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.7.6** · Node.js **22.5+** · License **Apache-2.0**
 
 > **Free-tier note.** Gemini / Antigravity free quota is about **100,000 TPM**. Use it as a lightweight chat API, not a high-throughput agent loop. On downstream tokens, turn off the three sandbox tools (code execution, Google Search, URL context) and let the caller's agent framework run tools instead.
 >
@@ -109,6 +109,7 @@ If the server was already running before a code update, restart Node.js and perf
 | `GATEWAY_MIGRATION_MAX_INPUT_TOKENS` | `24000` | Max estimated tokens for rebuilt context after a key change. |
 | `GATEWAY_INTERNAL_ERROR_RETRY_LIMIT` | `2` | Consecutive `Internal error encountered` hits before the session circuit opens (HTTP 400, no upstream). |
 | `GATEWAY_HASH_IGNORE_PREFIXES` | `["<RAG-Faiss-Memory>"]` | Literal prefixes stripped before `prefix_hash`. JSON array or newline-separated. |
+| `GATEWAY_MODELS` | four Flash backends | Default `/v1/models` catalog. JSON array or newline-separated. Overridable in the WebUI without a restart. |
 
 These TPM / migration values are defaults. The WebUI **协议中转站** panel and `GET/PATCH /api/gateway/settings` override them at runtime (no restart). Priority: WebUI / admin API > environment variables > code defaults. Each upstream key also shows this-minute RPM (memory) and today RPD (SQLite, Pacific midnight aligned with Google AI Studio).
 
@@ -164,7 +165,7 @@ By default, browser requests are accepted only from the matching local WebUI ori
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions gateway (Antigravity sandbox). |
 | `POST` | `/v1/responses` | OpenAI Responses gateway. `/v1/chat/responses` is an alias. |
 | `POST` | `/v1beta/models/{model}:generateContent` | Gemini-shaped request; still forwarded to Interactions. |
-| `GET` | `/v1/models` | Gateway model list (`antigravity-preview-05-2026` and four backend models). |
+| `GET` | `/v1/models` | Gateway model catalog (names added in the WebUI, no Antigravity prefix). |
 
 Interaction requests can also include:
 
@@ -182,9 +183,9 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 ## Protocol gateway
 
-Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open the **协议中转站** tab. Add an upstream Gemini key (stored encrypted) and create a downstream `ag-` token. Other apps should send that token, never the Gemini key. TPM strategy, limits, pacing waits, and the migration input budget can be changed in that same panel.
+Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open the **协议中转站** tab. Add an upstream Gemini key (stored encrypted, always shown and copyable in the panel) and create a downstream `ag-` token (also shown and copyable after issue). Other apps should send that token, never the Gemini key. TPM strategy, limits, pacing waits, the migration input budget, and the public model catalog can be changed in that same panel.
 
-The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. Allowed `agent_config.model` values are `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and `gemini-3.5-flash-lite`.
+The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. The downstream `model` field is copied into `agent_config.model` as-is. Add new names in **对外模型目录** when Google ships a model; you do not need to update this project.
 
 Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s the gateway migrates conversation context onto another key with a **new** sandbox. The default TPM strategy (`clone`, formerly `frok`) also migrates when recent usage hits `limit × ratio`. The optional `pace` strategy keeps the sticky key and waits until `recent usage + this round` is strictly below the TPM window; if the wait would exceed `tpmPaceMaxWaitMs` it still clones. Round size prefers the last success `total_tokens` on the conversation (including fork source/target keys) and otherwise estimates inline images as visual tokens (~1k–3k each, never Base64 `chars/4`). Downstream `conversation_mode` stays `continue`; the upstream hop is marked `clone` (key-rotation rebuild), not `new`. Tool history is sent as a non-executable summary (not `[Calls:]` templates) so the model cannot imitate fake tool traces.
 
@@ -196,23 +197,24 @@ Standard OpenAI clients do not need extra session fields. If the client compress
 - **Mutex Concurrency Locks**: Concurrent requests for the same `x-session-id` are queued and executed sequentially to prevent state collisions. Excess requests return HTTP 429 `session_busy`.
 - **End-to-End Trace Logs**: Every request is assigned a unique `request_id`, with automatic redaction of API keys, tokens, large Base64 images, and system instructions. Logs record both `conversation_mode` (`continue` / `new` / `fork`) and `upstream_transition` (`none` / `clone`). `[Calls:]` in model text is counted only, never executed.
 
-> **Note:** The model list above is hardcoded in `gateway/models.js` and `web/src/lib.js`. Google does not currently provide an API to query which `agent_config.model` values a managed agent supports — the standard `/v1beta/models` endpoint only returns standalone Gemini models, not agent-internal engine options. If Google adds or removes supported models in the future, these two files must be updated manually.
+> **Note:** Google does not currently provide an API to query which `agent_config.model` values a managed agent supports. The gateway therefore lets you edit the catalog in the WebUI (`PATCH /api/gateway/settings` `gatewayModels`, or `GATEWAY_MODELS`). `/v1/models` returns those names without an `antigravity-preview-05-2026/` prefix. Names that are not in the catalog still pass through to upstream `agent_config.model`.
 
 Conversation state uses `previous_interaction_id`. When the request is a proven continuation, client-replayed `messages[]` are treated as a delta and only the new turn is sent upstream. Unverifiable compressed or truncated history forks instead of being hard-attached to the old chain. Images (`image_url` / `inline_data`) are forwarded; local TPM / migration estimates use image dimensions (or 2800 tokens when unknown), not Base64 length. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
 
-The gateway does **not** expose the Gemini model catalog on the API key. It only serves the Antigravity agent and the four `agent_config.model` backends that agent accepts:
+The gateway does **not** expose the Gemini model catalog on the API key. `GET /v1/models` returns the names you added (defaults below). Clients should send those names, not `antigravity-preview-05-2026/...`:
 
-- `antigravity-preview-05-2026` (default backend `gemini-3.7-flash`)
-- `antigravity-preview-05-2026/gemini-3.7-flash`
-- `antigravity-preview-05-2026/gemini-3.6-flash`
-- `antigravity-preview-05-2026/gemini-3.5-flash`
-- `antigravity-preview-05-2026/gemini-3.5-flash-lite`
+- `gemini-3.7-flash` (default when the request omits `model`)
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3.5-flash-lite`
+
+Prefixed ids such as `antigravity-preview-05-2026/gemini-3.7-flash` still work; the prefix is stripped before the upstream call.
 
 ```powershell
 curl.exe http://localhost:3000/v1/chat/completions `
   -H "Authorization: Bearer ag-YOUR_TOKEN" `
   -H "Content-Type: application/json" `
-  --data-raw '{"model":"antigravity-preview-05-2026/gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
+  --data-raw '{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"ping"}]}'
 ```
 
 ## Data and privacy
