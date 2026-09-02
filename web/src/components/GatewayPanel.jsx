@@ -33,7 +33,7 @@ export default function GatewayPanel({
 
   // Edit token modal
   const [editingToken, setEditingToken] = useState(null);
-  const [tpmStrategy, setTpmStrategy] = useState(gatewaySettings?.tpmStrategy === 'pace' ? 'pace' : 'frok');
+  const [tpmStrategy, setTpmStrategy] = useState(gatewaySettings?.tpmStrategy === 'pace' ? 'pace' : 'clone');
   const [tpmLimit, setTpmLimit] = useState(String(gatewaySettings?.tpmLimit ?? 100000));
   const [tpmRatio, setTpmRatio] = useState(String(gatewaySettings?.tpmThresholdRatio ?? 0.8));
   const [tpmWindowMs, setTpmWindowMs] = useState(String(gatewaySettings?.tpmWindowMs ?? 60000));
@@ -42,10 +42,16 @@ export default function GatewayPanel({
   const [tpmPaceDelayMs, setTpmPaceDelayMs] = useState(String(gatewaySettings?.tpmPaceDelayMs ?? 5000));
   const [tpmReserveTtlMs, setTpmReserveTtlMs] = useState(String(gatewaySettings?.tpmReserveTtlMs ?? gatewaySettings?.tpmWindowMs ?? 60000));
   const [migrationMaxInputTokens, setMigrationMaxInputTokens] = useState(String(gatewaySettings?.migrationMaxInputTokens ?? 24000));
+  const [hashIgnorePrefixes, setHashIgnorePrefixes] = useState(
+    Array.isArray(gatewaySettings?.hashIgnorePrefixes)
+      ? gatewaySettings.hashIgnorePrefixes.join('\n')
+      : '<RAG-Faiss-Memory>'
+  );
+  const [internalErrorRetryLimit, setInternalErrorRetryLimit] = useState(String(gatewaySettings?.internalErrorRetryLimit ?? 2));
 
   useEffect(() => {
     if (!gatewaySettings) return;
-    setTpmStrategy(gatewaySettings.tpmStrategy === 'pace' ? 'pace' : 'frok');
+    setTpmStrategy(gatewaySettings.tpmStrategy === 'pace' ? 'pace' : 'clone');
     setTpmLimit(String(gatewaySettings.tpmLimit ?? 100000));
     setTpmRatio(String(gatewaySettings.tpmThresholdRatio ?? 0.8));
     setTpmWindowMs(String(gatewaySettings.tpmWindowMs ?? 60000));
@@ -54,6 +60,10 @@ export default function GatewayPanel({
     setTpmPaceDelayMs(String(gatewaySettings.tpmPaceDelayMs ?? 5000));
     setTpmReserveTtlMs(String(gatewaySettings.tpmReserveTtlMs ?? gatewaySettings.tpmWindowMs ?? 60000));
     setMigrationMaxInputTokens(String(gatewaySettings.migrationMaxInputTokens ?? 24000));
+    setHashIgnorePrefixes(Array.isArray(gatewaySettings.hashIgnorePrefixes)
+      ? gatewaySettings.hashIgnorePrefixes.join('\n')
+      : '');
+    setInternalErrorRetryLimit(String(gatewaySettings.internalErrorRetryLimit ?? 2));
   }, [gatewaySettings]);
 
   const example = useMemo(() => {
@@ -219,19 +229,19 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
       <section className="box">
         <div className="box-head">📈 TPM 策略</div>
         <p className="hint">
-          两种策略二选一，保存后立即生效。默认「立即换 Key」与发版前行为一致。
+          两种策略二选一，保存后立即生效。默认「立即克隆到新 Key」。旧设置里的 frok 会当成 clone。
         </p>
         <div className="row" style={{ gap: 16, marginBottom: 10 }}>
           <label className="check">
-            <input type="radio" name="tpm-strategy" checked={tpmStrategy === 'frok'} onChange={() => setTpmStrategy('frok')} />
-            <span>立即换 Key（frok）</span>
+            <input type="radio" name="tpm-strategy" checked={tpmStrategy === 'clone'} onChange={() => setTpmStrategy('clone')} />
+            <span>立即克隆到新 Key</span>
           </label>
           <label className="check">
             <input type="radio" name="tpm-strategy" checked={tpmStrategy === 'pace'} onChange={() => setTpmStrategy('pace')} />
             <span>排队等待（同一把 Key）</span>
           </label>
         </div>
-        {tpmStrategy === 'frok' ? (
+        {tpmStrategy === 'clone' ? (
           <p className="hint">
             滑动窗口内用量达到「TPM 上限 × 触发比例」时，粘性会话会主动迁移到空闲 Key。
             迁移时重建上下文不得超过 input token 预算。
@@ -242,7 +252,7 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
           </p>
         )}
         <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
-          {tpmStrategy === 'frok' ? (
+          {tpmStrategy === 'clone' ? (
             <>
               <label className="label" style={{ minWidth: 140 }}>
                 TPM 上限
@@ -308,6 +318,55 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
             保存策略
           </button>
         </div>
+      </section>
+
+      <section className="box">
+        <div className="box-head">🧾 会话哈希</div>
+        <p className="hint">
+          计算 prefix_hash 时忽略这些字面量前缀之后的易变注入（例如插件记忆）。只影响会话判定，发给模型的正文不删。每行一个标记，保存立即生效。
+        </p>
+        <label className="label">忽略前缀（每行一个）</label>
+        <textarea
+          className="input mono"
+          rows={4}
+          value={hashIgnorePrefixes}
+          onChange={(e) => setHashIgnorePrefixes(e.target.value)}
+          placeholder={'<RAG-Faiss-Memory>\n<system_reminder>'}
+          style={{ width: '100%', minHeight: 88 }}
+        />
+        <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: 'wrap' }}>
+          <label className="label" style={{ minWidth: 220 }}>
+            Internal error 熔断次数
+            <input
+              className="input"
+              value={internalErrorRetryLimit}
+              onChange={(e) => setInternalErrorRetryLimit(e.target.value)}
+              placeholder="2"
+            />
+          </label>
+          <button
+            className="btn btn-primary"
+            onClick={async () => {
+              try {
+                await gatewayFetch('/api/gateway/settings', {
+                  method: 'PATCH',
+                  body: JSON.stringify({
+                    hashIgnorePrefixes,
+                    internalErrorRetryLimit: Number(internalErrorRetryLimit)
+                  })
+                });
+                loadGateway();
+              } catch (err) {
+                setGatewayError(err.message);
+              }
+            }}
+          >
+            保存会话设置
+          </button>
+        </div>
+        <p className="hint" style={{ marginTop: 8 }}>
+          同一会话连续命中 Internal error 达到该次数后，后续请求不再打上游，直接 HTTP 400。成功或 fork 新链后清零。
+        </p>
       </section>
 
       {/* 3. Downstream Token Management (Module 5) */}

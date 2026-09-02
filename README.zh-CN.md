@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.7.4** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.7.5** · Node.js **22.5+** · License **Apache-2.0**
 
 > **免费档使用建议。** Gemini / Antigravity 免费层级大约只有 **100,000 TPM**，适合当作轻量聊天 API，不适合高并发或重度 Agent 循环。建议在下游 Token 上关闭沙盒三项内置工具（代码执行、谷歌搜索、网页抓取），把工具执行交给调用方自己的 Agent 框架。
 >
@@ -98,15 +98,17 @@ npm run dev
 | `GATEWAY_MASTER_KEY` | 空 | 加密上游 Gemini Key 并启用中转站，必填。 |
 | `GATEWAY_ADMIN_TOKEN` | 空 | 中转站管理 API / WebUI 面板的 Bearer Token。 |
 | `GATEWAY_ENFORCE_SESSION_HEADER` | `false` | 设为 `true` 时强制要求客户端提供 `x-session-id`，缺失时返回 400，防止多对话串台。 |
-| `GATEWAY_TPM_STRATEGY` | `frok` | `frok` 立即换热 Key；`pace` 同一把 Key 上等到下一轮能严格塞进窗口。 |
+| `GATEWAY_TPM_STRATEGY` | `clone` | `clone`（旧名 `frok`）立即换热 Key；`pace` 同一把 Key 上等到下一轮能严格塞进窗口。 |
 | `GATEWAY_TPM_LIMIT` | `100000` | 策略 A：滑动窗口 TPM 上限，到达后主动换 Key 并迁移上下文。 |
 | `GATEWAY_TPM_THRESHOLD_RATIO` | `0.8` | 策略 A：用量达到 `上限 × 比例` 时触发避让 / 迁移。 |
 | `GATEWAY_TPM_PACE_LIMIT` | `100000` | 策略 B：仅当 `已用量 + 本轮预估 < 此窗口` 才立刻上传。 |
 | `GATEWAY_TPM_WINDOW_MS` | `60000` | TPM 滑动窗口，毫秒（两套策略共用）。 |
-| `GATEWAY_TPM_PACE_MAX_WAIT_MS` | `20000` | 策略 B：预计等待超过此时长则仍 frok。 |
+| `GATEWAY_TPM_PACE_MAX_WAIT_MS` | `20000` | 策略 B：预计等待超过此时长则仍 clone。 |
 | `GATEWAY_TPM_PACE_DELAY_MS` | `5000` | 策略 B：窗口已能塞下后再额外延迟。 |
 | `GATEWAY_TPM_RESERVE_TTL_MS` | 跟随窗口 | 策略 B：预约超时自动释放，防止异常占额度。 |
 | `GATEWAY_MIGRATION_MAX_INPUT_TOKENS` | `24000` | Key 轮换重建上下文时的估算 token 上限。 |
+| `GATEWAY_INTERNAL_ERROR_RETRY_LIMIT` | `2` | 同一会话连续命中 `Internal error encountered` 后熔断，后续请求 HTTP 400、不再打上游。 |
+| `GATEWAY_HASH_IGNORE_PREFIXES` | `["<RAG-Faiss-Memory>"]` | 算 `prefix_hash` 前剥离的字面量前缀。JSON 数组或换行分隔。 |
 
 以上 TPM / 迁移项是启动默认值。WebUI「协议中转站」和 `GET/PATCH /api/gateway/settings` 可在运行时覆盖，不必重启。优先级：WebUI / 管理 API > 环境变量 > 代码默认。每把上游 Key 还会显示本分钟 RPM（内存）和今日 RPD（SQLite，洛杉矶午夜对齐 Google AI Studio）。
 
@@ -183,7 +185,7 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。允许的 `agent_config.model`：`gemini-3.7-flash`、`gemini-3.6-flash`、`gemini-3.5-flash`、`gemini-3.5-flash-lite`。
 
-可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 时，会把当前对话带到下一把 Key 上开**新沙盒**继续。默认 TPM 策略（`frok`）在用量达到 `上限 × 比例` 时同样迁移。可选 `pace` 策略会钉住原 Key，等到 `已用量 + 本轮` 严格小于 TPM 窗口再发；预计等待超过 `tpmPaceMaxWaitMs` 仍 frok。本轮大小优先用该会话最近一次成功 `total_tokens`（含 fork 主干/分支 key），否则按视觉 token 估算 inline 图片（大约 1k–3k / 张，不再把 Base64 当 `chars/4`）。下游 `conversation_mode` 仍为 `continue`，上游记为 `frok`（Key 轮换重建），不是 `new`。工具历史以不可执行摘要迁移，不再生成 `[Calls:]` 模板，避免模型模仿假工具调用（旧沙盒里的文件带不过去）。
+可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 时，会把当前对话带到下一把 Key 上开**新沙盒**继续。默认 TPM 策略（`clone`，旧名 `frok`）在用量达到 `上限 × 比例` 时同样迁移。可选 `pace` 策略会钉住原 Key，等到 `已用量 + 本轮` 严格小于 TPM 窗口再发；预计等待超过 `tpmPaceMaxWaitMs` 仍 clone。本轮大小优先用该会话最近一次成功 `total_tokens`（含 fork 主干/分支 key），否则按视觉 token 估算 inline 图片（大约 1k–3k / 张，不再把 Base64 当 `chars/4`）。下游 `conversation_mode` 仍为 `continue`，上游记为 `clone`（Key 轮换重建），不是 `new`。工具历史以不可执行摘要迁移，不再生成 `[Calls:]` 模板，避免模型模仿假工具调用（旧沙盒里的文件带不过去）。
 
 标准 OpenAI 客户端不必传私有会话字段。若客户端压缩、截断或重放旧消息，且网关无法证明与主干连续，会 **fork** 到内部派生 key，主干 `interaction_id` 保持不变。
 
@@ -191,7 +193,7 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 - **会话隔离**：客户端（如 QQ 机器人、多窗口聊天客户端）应在请求头中传入 `x-session-id`（例如 `qq:private:{user_id}` 或 `qq:group:{group_id}`）。每个会话拥有完全独立的上下文链与远程沙盒环境，共用同一把 API Key 也绝不会发生串台。
 - **并发互斥锁**：同一 `x-session-id` 的并发请求会在服务端自动排队串行处理，防止旧请求覆盖新交互状态；超出排队上限时返回 HTTP 429 `session_busy`。
-- **全链路诊断日志**：每个请求分配唯一 `request_id`，自动脱敏 API Key、Authorization 头、超大图片 Base64 与系统指令。日志同时记录 `conversation_mode`（`continue` / `new` / `fork`）和 `upstream_transition`（`none` / `frok`）。模型文本中的 `[Calls:]` 只计数观测，不会被解析或执行。
+- **全链路诊断日志**：每个请求分配唯一 `request_id`，自动脱敏 API Key、Authorization 头、超大图片 Base64 与系统指令。日志同时记录 `conversation_mode`（`continue` / `new` / `fork`）和 `upstream_transition`（`none` / `clone`）。模型文本中的 `[Calls:]` 只计数观测，不会被解析或执行。
 
 > **注意**：上述模型列表是在代码中硬编码的（`gateway/models.js` 和 `web/src/lib.js`）。Google 目前没有提供 API 来查询某个 managed agent 支持哪些 `agent_config.model` 值——标准的 `/v1beta/models` 接口只返回独立 Gemini 模型目录，不包含 Agent 内部引擎信息。如果 Google 将来新增或下线模型，需要手动更新这两个文件。
 

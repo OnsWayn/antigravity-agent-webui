@@ -45,7 +45,34 @@ function imageFingerprint(part) {
   return `[image:${String(url).slice(0, 80)}]`;
 }
 
-function normalizeForHash(message) {
+function ignoredPrefixTagName(prefix) {
+  const match = String(prefix || '').match(/^<([A-Za-z][\w:.-]*)(?:\s[^>]*)?>$/);
+  return match ? match[1] : null;
+}
+
+function stripIgnoredPrefixes(text, prefixes = [], hits) {
+  let next = String(text ?? '');
+  if (!next || !Array.isArray(prefixes) || prefixes.length === 0) return next;
+  for (const prefix of prefixes) {
+    if (typeof prefix !== 'string' || !prefix) continue;
+    const index = next.indexOf(prefix);
+    if (index < 0) continue;
+    if (hits && typeof hits.add === 'function') hits.add(prefix);
+    const tag = ignoredPrefixTagName(prefix);
+    if (tag) {
+      const close = `</${tag}>`;
+      const closeIndex = next.indexOf(close, index + prefix.length);
+      if (closeIndex >= 0) {
+        next = `${next.slice(0, index)}${next.slice(closeIndex + close.length)}`.replace(/\s+$/u, '');
+        continue;
+      }
+    }
+    next = next.slice(0, index).replace(/\s+$/u, '');
+  }
+  return next;
+}
+
+function normalizeForHash(message, prefixes = [], hits) {
   if (!message) return null;
   const toolCalls = Array.isArray(message.tool_calls)
     ? message.tool_calls.map((call) => call.id || call.function?.name || '')
@@ -62,7 +89,7 @@ function normalizeForHash(message) {
   }
   return {
     role: message.role || '',
-    text,
+    text: stripIgnoredPrefixes(text, prefixes, hits),
     tool_call_id: message.tool_call_id || null,
     name: message.name || null,
     tool_calls: toolCalls
@@ -76,8 +103,8 @@ function fingerprintMessages(messages) {
   });
 }
 
-function hashNonAssistant(messages) {
-  return sha256(JSON.stringify(fingerprintMessages(messages).map(normalizeForHash)));
+function hashNonAssistant(messages, prefixes = [], hits) {
+  return sha256(JSON.stringify(fingerprintMessages(messages).map((message) => normalizeForHash(message, prefixes, hits))));
 }
 
 function parseDataUrl(url) {
@@ -713,7 +740,7 @@ function withConversationMeta(conversation, extra = {}) {
   };
 }
 
-function resolveStoredConversation(database, tokenId, sourceKey, messages) {
+function resolveStoredConversation(database, tokenId, sourceKey, messages, prefixes = []) {
   if (!database || typeof database.listGatewayConversationsForSource !== 'function') {
     return database?.getGatewayConversation?.(tokenId, sourceKey) || null;
   }
@@ -723,7 +750,7 @@ function resolveStoredConversation(database, tokenId, sourceKey, messages) {
   const toolMessages = trailingToolMessages(msgs);
   const isToolTurn = toolMessages.length > 0;
   const prefix = isToolTurn ? msgs.slice(0, msgs.length - toolMessages.length) : msgs.slice(0, -1);
-  const prefixHash = hashNonAssistant(prefix);
+  const prefixHash = hashNonAssistant(prefix, prefixes);
   const exact = rows.find((row) => row.prefix_hash === prefixHash);
   if (exact) return exact;
 
@@ -731,7 +758,7 @@ function resolveStoredConversation(database, tokenId, sourceKey, messages) {
   const prefixWithoutSystem = isToolTurn
     ? withoutSystem.slice(0, withoutSystem.length - toolMessages.length)
     : withoutSystem.slice(0, -1);
-  const altHash = hashNonAssistant(prefixWithoutSystem);
+  const altHash = hashNonAssistant(prefixWithoutSystem, prefixes);
   const sysMatch = rows.find((row) => row.prefix_hash === altHash);
   if (sysMatch) return sysMatch;
   return rows.find((row) => row.conversation_key === sourceKey) || rows[0] || null;
@@ -815,9 +842,12 @@ function buildOpenAIConversation({
   resolveCallId,
   requestId,
   sourceConversationKey,
-  maxInputTokens
+  maxInputTokens,
+  hashIgnorePrefixes = []
 } = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
+  const prefixes = Array.isArray(hashIgnorePrefixes) ? hashIgnorePrefixes : [];
+  const hashHits = new Set();
   const stateless = headerFlag(headers, 'x-ag-stateless') || body.store === false;
   const reuseEnv = headerFlag(headers, 'x-ag-reuse-environment');
   const systemInstruction = msgs
@@ -827,8 +857,12 @@ function buildOpenAIConversation({
     .join('\n') || undefined;
   const lookupKey = sourceConversationKey || conversationKeyFrom({ messages: msgs, headers, body });
   const storedKey = stored?.conversation_key || lookupKey;
-  const nextPrefixHash = hashNonAssistant(msgs);
+  const nextPrefixHash = hashNonAssistant(msgs, prefixes, hashHits);
   const callMarkers = observeCallMarkers(msgs);
+  const hashMeta = () => ({
+    hashIgnoreHits: [...hashHits],
+    hashIgnoreApplied: hashHits.size > 0
+  });
 
   if (stateless) {
     const rebuilt = buildSafeHistoryInput(msgs, { kind: 'history', maxInputTokens });
@@ -843,7 +877,8 @@ function buildOpenAIConversation({
       upstreamKeyId: stored?.upstream_key_id || null,
       toolTraceStatus: rebuilt.summary.toolTraceStatus,
       callMarkers,
-      ...historyMetaFromRebuild(rebuilt)
+      ...historyMetaFromRebuild(rebuilt),
+      ...hashMeta()
     }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
@@ -851,7 +886,7 @@ function buildOpenAIConversation({
   const isToolTurn = toolMessages.length > 0;
   const last = msgs[msgs.length - 1];
   const prefix = isToolTurn ? msgs.slice(0, msgs.length - toolMessages.length) : msgs.slice(0, -1);
-  const prefixHash = hashNonAssistant(prefix);
+  const prefixHash = hashNonAssistant(prefix, prefixes, hashHits);
 
   const input = isToolTurn
     ? toolMessages.map((message) => toFunctionResult(message, resolveCallId))
@@ -873,7 +908,8 @@ function buildOpenAIConversation({
       upstreamKeyId: null,
       toolTraceStatus: rebuilt?.summary.toolTraceStatus || 'none',
       callMarkers,
-      ...historyMetaFromRebuild(rebuilt)
+      ...historyMetaFromRebuild(rebuilt),
+      ...hashMeta()
     }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
@@ -881,7 +917,7 @@ function buildOpenAIConversation({
     const prefixWithoutSystem = isToolTurn
       ? withoutSystem.slice(0, withoutSystem.length - toolMessages.length)
       : withoutSystem.slice(0, -1);
-    const storedWithoutSystem = hashNonAssistant(prefixWithoutSystem);
+    const storedWithoutSystem = hashNonAssistant(prefixWithoutSystem, prefixes, hashHits);
 
     if (storedWithoutSystem === stored.prefix_hash && stored.interaction_id) {
       return withConversationMeta({
@@ -893,7 +929,8 @@ function buildOpenAIConversation({
         nextPrefixHash,
         mode: 'continue',
         upstreamKeyId: stored.upstream_key_id || null,
-        callMarkers
+        callMarkers,
+        ...hashMeta()
       }, { sourceConversationKey: lookupKey, targetConversationKey: storedKey });
     }
 
@@ -911,7 +948,8 @@ function buildOpenAIConversation({
       upstreamKeyId: stored.upstream_key_id || null,
       toolTraceStatus: rebuilt.summary.toolTraceStatus,
       callMarkers,
-      ...historyMetaFromRebuild(rebuilt)
+      ...historyMetaFromRebuild(rebuilt),
+      ...hashMeta()
     }, {
       sourceConversationKey: lookupKey,
       targetConversationKey,
@@ -928,7 +966,8 @@ function buildOpenAIConversation({
     nextPrefixHash,
     mode: 'continue',
     upstreamKeyId: stored.upstream_key_id || null,
-    callMarkers
+    callMarkers,
+    ...hashMeta()
   }, { sourceConversationKey: lookupKey, targetConversationKey: storedKey });
 }
 
@@ -1360,9 +1399,9 @@ function parseTranscript(stored) {
   }
 }
 
-function isDuplicateCompletedTurn(messages, stored) {
+function isDuplicateCompletedTurn(messages, stored, prefixes = []) {
   if (!stored?.prefix_hash) return false;
-  return hashNonAssistant(messages) === stored.prefix_hash;
+  return hashNonAssistant(messages, prefixes) === stored.prefix_hash;
 }
 
 function lastAssistantFromTranscript(stored) {
@@ -1480,7 +1519,7 @@ function migrateConversationForKeyChange(conversation, source = {}, options = {}
     callMarkers: rebuilt.callMarkers || conversation.callMarkers,
     ...historyMetaFromRebuild(rebuilt)
   }, {
-    upstreamTransition: 'frok',
+    upstreamTransition: 'clone',
     sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
     targetConversationKey: conversation.targetConversationKey || conversation.conversationKey
   });
@@ -1590,6 +1629,7 @@ module.exports = {
   DEFAULT_ANTIGRAVITY_TOOLS,
   textOfMessage,
   hashNonAssistant,
+  stripIgnoredPrefixes,
   parseImageRef,
   openaiMessageToInputParts,
   flattenMessagesToInput,

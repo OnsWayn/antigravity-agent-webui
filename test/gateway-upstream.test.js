@@ -5,7 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { AppDatabase } = require('../database');
 const { encryptSecret, keySuffix } = require('../gateway/crypto');
-const { isRateLimitError, pickUpstreamKey, TpmTracker, RequestCounter } = require('../gateway/upstream');
+const { isRateLimitError, isInternalError, pickUpstreamKey, TpmTracker, RequestCounter } = require('../gateway/upstream');
 
 function withDatabase(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-up-'));
@@ -33,6 +33,12 @@ test('detects 429 and resource exhausted as rate limits', () => {
   assert.equal(isRateLimitError({ status: 429, message: 'slow down' }), true);
   assert.equal(isRateLimitError({ status: 400, code: 'RESOURCE_EXHAUSTED' }), true);
   assert.equal(isRateLimitError({ status: 500, message: 'boom' }), false);
+});
+
+test('detects Internal error encountered and does not treat it as a rate limit', () => {
+  assert.equal(isInternalError({ status: 500, code: 'api_error', message: 'Internal error encountered.' }), true);
+  assert.equal(isInternalError({ status: 500, message: 'internal error encountered' }), true);
+  assert.equal(isRateLimitError({ status: 500, code: 'api_error', message: 'Internal error encountered.' }), false);
 });
 
 test('new chats round-robin least recently used keys', () => {

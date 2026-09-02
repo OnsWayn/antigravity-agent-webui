@@ -160,9 +160,33 @@ function emitGeminiStream({ res, data }) {
   writeSse(res, payload);
 }
 
+function extractStreamError(event) {
+  if (!event || typeof event !== 'object') return null;
+  const type = String(event.event_type || event.type || '');
+  const status = event.status;
+  const errObj = event.error;
+  const looksError = type === 'error'
+    || type === 'interaction.failed'
+    || type === 'interaction.error'
+    || status === 'failed'
+    || status === 'error'
+    || (errObj && typeof errObj === 'object' && (errObj.message || errObj.status || errObj.code));
+  if (!looksError) return null;
+  const details = errObj && typeof errObj === 'object' ? errObj : event;
+  const message = details.message || event.message || 'Internal error encountered.';
+  const error = new Error(message);
+  const codeNum = Number(details.code);
+  error.status = Number.isFinite(codeNum) && codeNum >= 400 ? codeNum : 500;
+  error.code = details.status || details.code || 'INTERNAL';
+  error.rawError = event;
+  return error;
+}
+
 function applyStreamEvent(event, state) {
-  const next = state || { text: '', calls: {}, id: null, status: null, usage: null, data: null };
+  const next = state || { text: '', calls: {}, id: null, status: null, usage: null, data: null, upstreamError: null };
   if (!event || typeof event !== 'object') return next;
+  const streamError = extractStreamError(event);
+  if (streamError) next.upstreamError = streamError;
   if (event.id) next.id = event.id;
   if (event.status) next.status = event.status;
   if (event.usage) next.usage = event.usage;
@@ -201,6 +225,11 @@ function applyStreamEvent(event, state) {
 }
 
 function finalizeStreamState(state) {
+  if (state?.upstreamError) {
+    const error = state.upstreamError;
+    error.data = state.data || null;
+    throw error;
+  }
   const calls = Object.values(state.calls || {});
   const data = state.data || {
     id: state.id,
@@ -233,6 +262,7 @@ module.exports = {
   emitLiveChatDelta,
   emitResponsesStream,
   emitGeminiStream,
+  extractStreamError,
   applyStreamEvent,
   finalizeStreamState
 };

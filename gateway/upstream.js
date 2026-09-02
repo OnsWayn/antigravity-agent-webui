@@ -16,6 +16,31 @@ function isRateLimitError(error) {
     || text.includes('quota');
 }
 
+function isInternalError(error) {
+  const message = String(error?.message || '');
+  const code = String(error?.code || error?.statusName || '').toUpperCase();
+  const status = Number(error?.status);
+  const messageMatch = /internal error encountered/i.test(message);
+  if (messageMatch) return true;
+  if (status === 500 && (code === 'INTERNAL' || code === 'API_ERROR') && messageMatch) return true;
+  return false;
+}
+
+function rewriteInternalError(error) {
+  const original = String(error?.message || '').trim();
+  const message = /internal error encountered/i.test(original)
+    ? original
+    : 'Internal error encountered.';
+  const next = new Error(message);
+  next.status = 400;
+  next.code = 'INTERNAL';
+  next.type = 'invalid_request_error';
+  next.rawError = error?.rawError || {
+    error: { message, type: 'invalid_request_error', code: 'INTERNAL' }
+  };
+  return next;
+}
+
 function decryptKeyRow(row, masterKey) {
   const apiKey = decryptSecret({
     ciphertext: row.key_ciphertext,
@@ -221,7 +246,7 @@ function pickUpstreamKey(database, masterKey, {
   excludeIds = [],
   now = Date.now(),
   tpmTracker,
-  strategy = 'frok',
+  strategy = 'clone',
   tpmPaceLimit,
   needed = 0
 } = {}) {
@@ -299,6 +324,8 @@ module.exports = {
   RATE_LIMIT_TRIES_PER_KEY,
   RATE_LIMIT_COOLDOWN_MS,
   isRateLimitError,
+  isInternalError,
+  rewriteInternalError,
   pickUpstreamKey,
   decryptKeyRow,
   TpmTracker,

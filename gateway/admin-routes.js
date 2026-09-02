@@ -41,7 +41,9 @@ const SETTINGS_PATCH_KEYS = [
   'tpmPaceMaxWaitMs',
   'tpmPaceDelayMs',
   'tpmReserveTtlMs',
-  'migrationMaxInputTokens'
+  'migrationMaxInputTokens',
+  'internalErrorRetryLimit',
+  'hashIgnorePrefixes'
 ];
 
 function createAdminRouter(options = {}) {

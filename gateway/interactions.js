@@ -1,5 +1,6 @@
 const fetch = require('node-fetch');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const { extractStreamError } = require('./stream');
 
 const GEMINI_INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
@@ -89,7 +90,8 @@ async function callInteractions({
   payload,
   proxyUrl,
   stream = false,
-  onEvent
+  onEvent,
+  onStreamReady
 }) {
   const proxy = proxyUrl || resolveEnvProxyUrl();
   const body = { ...payload };
@@ -131,16 +133,22 @@ async function callInteractions({
 
   const contentType = String(response.headers.get('content-type') || '').toLowerCase();
   if (stream && response.ok && contentType.includes('application/json') && !contentType.includes('event-stream')) {
+    if (typeof onStreamReady === 'function') await onStreamReady(response);
     const data = await response.json();
+    const failed = extractStreamError(data);
+    if (failed) throw failed;
     if (onEvent) await onEvent(data);
     return data;
   }
 
   if (stream && response.ok) {
+    if (typeof onStreamReady === 'function') await onStreamReady(response);
     const events = [];
     await parseSseStream(response.body, async (event) => {
       events.push(event);
       if (onEvent) await onEvent(event);
+      const failed = extractStreamError(event);
+      if (failed) throw failed;
     });
     return { stream: true, events, status: response.status };
   }

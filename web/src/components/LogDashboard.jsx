@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import { copyText, formatDate, formatDuration, formatTokens, safeJson } from '../lib';
 
+function displayCloneAlias(value) {
+  if (value == null) return value;
+  const text = String(value);
+  if (text === 'frok') return 'clone';
+  return text.replace(/frok/g, 'clone');
+}
+
 function diagnosticsOf(log) {
   const raw = log?.diagnostics_json;
   if (!raw) return {};
@@ -241,7 +248,7 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                   <span className="meta-val mono">{log.conversation_key || '无'}</span>
                   <span className="tag" style={{ marginLeft: 4 }}>模式: {log.conversation_mode || 'stateless'}</span>
                   {log.upstream_transition && log.upstream_transition !== 'none' && (
-                    <span className="tag" style={{ marginLeft: 4 }}>上游: {log.upstream_transition}</span>
+                    <span className="tag" style={{ marginLeft: 4 }}>上游: {displayCloneAlias(log.upstream_transition)}</span>
                   )}
                   {log.context_rebuild_reason && (
                     <span className="tag" style={{ marginLeft: 4 }}>原因: {log.context_rebuild_reason}</span>
@@ -253,7 +260,13 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                     <span className="badge warn" style={{ marginLeft: 4 }}>[Calls:] × {log.raw_call_marker_count}</span>
                   )}
                   {diag.tpmPacingDecision && (
-                    <span className="tag" style={{ marginLeft: 4 }}>pace: {diag.tpmPacingDecision}</span>
+                    <span className="tag" style={{ marginLeft: 4 }}>pace: {displayCloneAlias(diag.tpmPacingDecision)}</span>
+                  )}
+                  {diag.internalErrorCircuit && (
+                    <span className="badge err" style={{ marginLeft: 4 }}>internal circuit</span>
+                  )}
+                  {diag.hashIgnoreApplied && Array.isArray(diag.hashIgnoreHits) && diag.hashIgnoreHits.length > 0 && (
+                    <span className="tag" style={{ marginLeft: 4 }}>hash-ignore: {diag.hashIgnoreHits.length}</span>
                   )}
                   {diag.neededSource && (
                     <span className="tag" style={{ marginLeft: 4 }}>

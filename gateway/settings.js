@@ -1,12 +1,14 @@
 const DEFAULT_GATEWAY_SETTINGS = {
-  tpmStrategy: 'frok',
+  tpmStrategy: 'clone',
   tpmLimit: 100000,
   tpmThresholdRatio: 0.8,
   tpmWindowMs: 60000,
   tpmPaceLimit: 100000,
   tpmPaceMaxWaitMs: 20000,
   tpmPaceDelayMs: 5000,
-  migrationMaxInputTokens: 24000
+  migrationMaxInputTokens: 24000,
+  internalErrorRetryLimit: 2,
+  hashIgnorePrefixes: ['<RAG-Faiss-Memory>']
 };
 
 function parsePositiveInt(value, fallback) {
@@ -29,8 +31,12 @@ function parseRatio(value, fallback) {
 
 function parseStrategy(value, fallback = DEFAULT_GATEWAY_SETTINGS.tpmStrategy) {
   const raw = String(value || '').trim().toLowerCase();
-  if (raw === 'frok' || raw === 'pace') return raw;
-  return fallback === 'pace' || fallback === 'frok' ? fallback : 'frok';
+  if (raw === 'frok' || raw === 'clone') return 'clone';
+  if (raw === 'pace') return 'pace';
+  const fb = String(fallback || '').trim().toLowerCase();
+  if (fb === 'pace') return 'pace';
+  if (fb === 'frok' || fb === 'clone') return 'clone';
+  return 'clone';
 }
 
 function invalidSettings(message) {
@@ -38,6 +44,49 @@ function invalidSettings(message) {
   error.status = 400;
   error.code = 'invalid_settings';
   return error;
+}
+
+function splitPrefixSource(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+  return trimmed.split(/\r?\n/);
+}
+
+function parsePrefixList(value, fallback = DEFAULT_GATEWAY_SETTINGS.hashIgnorePrefixes, { strict = false } = {}) {
+  if (value == null) return Array.isArray(fallback) ? fallback.slice() : [];
+  if (typeof value === 'string' && value.trim() === '') {
+    if (strict) throw invalidSettings('hashIgnorePrefixes must not be an empty string');
+    return [];
+  }
+  const source = splitPrefixSource(value);
+  if (!source) {
+    if (strict) throw invalidSettings('hashIgnorePrefixes must be an array or newline-separated string');
+    return Array.isArray(fallback) ? fallback.slice() : [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (const item of source) {
+    const prefix = String(item == null ? '' : item).trim();
+    if (!prefix) continue;
+    if (prefix.length < 2 || prefix.length > 200) {
+      if (strict) throw invalidSettings('hashIgnorePrefixes entries must be 2–200 characters');
+      continue;
+    }
+    if (seen.has(prefix)) continue;
+    seen.add(prefix);
+    out.push(prefix);
+    if (out.length > 32) {
+      if (strict) throw invalidSettings('hashIgnorePrefixes supports at most 32 entries');
+      break;
+    }
+  }
+  return out;
 }
 
 function envGatewaySettings() {
@@ -53,6 +102,15 @@ function envGatewaySettings() {
     migrationMaxInputTokens: parsePositiveInt(
       process.env.GATEWAY_MIGRATION_MAX_INPUT_TOKENS,
       DEFAULT_GATEWAY_SETTINGS.migrationMaxInputTokens
+    ),
+    internalErrorRetryLimit: parsePositiveInt(
+      process.env.GATEWAY_INTERNAL_ERROR_RETRY_LIMIT,
+      DEFAULT_GATEWAY_SETTINGS.internalErrorRetryLimit
+    ),
+    hashIgnorePrefixes: parsePrefixList(
+      process.env.GATEWAY_HASH_IGNORE_PREFIXES,
+      DEFAULT_GATEWAY_SETTINGS.hashIgnorePrefixes,
+      { strict: false }
     )
   };
   if (process.env.GATEWAY_TPM_RESERVE_TTL_MS != null && process.env.GATEWAY_TPM_RESERVE_TTL_MS !== '') {
@@ -81,6 +139,15 @@ function clampGatewaySettings(input = {}, fallback = DEFAULT_GATEWAY_SETTINGS) {
     base.tpmReserveTtlMs,
     parsePositiveInt(fallback.tpmReserveTtlMs, tpmWindowMs)
   );
+  const internalErrorRetryLimit = parsePositiveInt(
+    base.internalErrorRetryLimit,
+    fallback.internalErrorRetryLimit ?? DEFAULT_GATEWAY_SETTINGS.internalErrorRetryLimit
+  );
+  const hashIgnorePrefixes = parsePrefixList(
+    base.hashIgnorePrefixes,
+    fallback.hashIgnorePrefixes ?? DEFAULT_GATEWAY_SETTINGS.hashIgnorePrefixes,
+    { strict: true }
+  );
 
   if (tpmLimit < 1000) throw invalidSettings('tpmLimit must be >= 1000');
   if (tpmThresholdRatio < 0.1 || tpmThresholdRatio > 1) throw invalidSettings('tpmThresholdRatio must be between 0.1 and 1');
@@ -88,6 +155,7 @@ function clampGatewaySettings(input = {}, fallback = DEFAULT_GATEWAY_SETTINGS) {
   if (tpmPaceLimit < 1000) throw invalidSettings('tpmPaceLimit must be >= 1000');
   if (tpmReserveTtlMs < 1000) throw invalidSettings('tpmReserveTtlMs must be >= 1000');
   if (migrationMaxInputTokens < 1024) throw invalidSettings('migrationMaxInputTokens must be >= 1024');
+  if (internalErrorRetryLimit < 1) throw invalidSettings('internalErrorRetryLimit must be >= 1');
 
   return {
     tpmStrategy,
@@ -98,7 +166,9 @@ function clampGatewaySettings(input = {}, fallback = DEFAULT_GATEWAY_SETTINGS) {
     tpmPaceMaxWaitMs,
     tpmPaceDelayMs,
     tpmReserveTtlMs,
-    migrationMaxInputTokens
+    migrationMaxInputTokens,
+    internalErrorRetryLimit,
+    hashIgnorePrefixes
   };
 }
 
@@ -113,5 +183,7 @@ module.exports = {
   DEFAULT_GATEWAY_SETTINGS,
   envGatewaySettings,
   clampGatewaySettings,
-  resolveGatewaySettings
+  resolveGatewaySettings,
+  parsePrefixList,
+  parseStrategy
 };

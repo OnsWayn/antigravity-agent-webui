@@ -3,7 +3,7 @@ const { authenticateClient } = require('./auth');
 const { openaiError, geminiError, sendJson } = require('./errors');
 const { callInteractions } = require('./interactions');
 const { AGENT_ID, listGatewayModels, resolveModel } = require('./models');
-const { isRateLimitError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker, RequestCounter } = require('./upstream');
+const { isRateLimitError, isInternalError, rewriteInternalError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker, RequestCounter } = require('./upstream');
 const {
   applyStreamEvent,
   emitChatCompletionsFinish,
@@ -114,6 +114,59 @@ function mergeRequestDiagnostics(database, requestId, patch = {}) {
   database.updateGatewayRequestLog(requestId, {
     diagnosticsJson: { ...current, ...patch }
   });
+}
+
+function isCloneTransition(value) {
+  return value === 'clone' || value === 'frok';
+}
+
+class InternalErrorCircuit {
+  constructor({ windowMs = 5 * 60 * 1000 } = {}) {
+    this.windowMs = windowMs;
+    this.hits = new Map();
+  }
+
+  makeKey(conversationKey, previousInteractionId) {
+    return `${conversationKey || ''}::${previousInteractionId || ''}`;
+  }
+
+  prune(now = Date.now()) {
+    for (const [key, row] of this.hits) {
+      if (!row || now - Number(row.lastAt || 0) > this.windowMs) this.hits.delete(key);
+    }
+  }
+
+  snapshot(conversationKey, previousInteractionId, now = Date.now()) {
+    this.prune(now);
+    return this.hits.get(this.makeKey(conversationKey, previousInteractionId)) || { count: 0 };
+  }
+
+  isOpen(conversationKey, previousInteractionId, limit, now = Date.now()) {
+    const threshold = Number(limit);
+    if (!(threshold > 0)) return false;
+    return this.snapshot(conversationKey, previousInteractionId, now).count >= threshold;
+  }
+
+  record(conversationKey, previousInteractionId, now = Date.now()) {
+    this.prune(now);
+    const key = this.makeKey(conversationKey, previousInteractionId);
+    const prev = this.hits.get(key);
+    const next = {
+      count: (prev?.count || 0) + 1,
+      lastAt: now,
+      firstAt: prev?.firstAt || now
+    };
+    this.hits.set(key, next);
+    return next;
+  }
+
+  clearConversation(conversationKey) {
+    if (!conversationKey) return;
+    const prefix = `${conversationKey}::`;
+    for (const key of [...this.hits.keys()]) {
+      if (key.startsWith(prefix)) this.hits.delete(key);
+    }
+  }
 }
 
 function disconnectedError() {
@@ -285,7 +338,7 @@ function persistSuccess({ database, token, conversation, resolved, data, endpoin
   let persistenceConflict = false;
 
   if (mode !== 'stateless' && targetKey) {
-    const isContinue = mode === 'continue' || conversation?.upstreamTransition === 'frok';
+    const isContinue = mode === 'continue' || isCloneTransition(conversation?.upstreamTransition);
     const cas = isContinue && stored && stored.conversation_key === targetKey
       ? {
         expectedInteractionId: stored.interaction_id || null,
@@ -308,7 +361,9 @@ function persistSuccess({ database, token, conversation, resolved, data, endpoin
       parentUpstreamKeyId: conversation.parentUpstreamKeyId || null,
       ...cas
     });
-    persistenceDecision = mode === 'fork' ? 'write_branch' : (conversation?.upstreamTransition === 'frok' ? 'update_trunk_after_frok' : 'update_trunk');
+    persistenceDecision = mode === 'fork'
+      ? 'write_branch'
+      : (isCloneTransition(conversation?.upstreamTransition) ? 'update_trunk_after_clone' : 'update_trunk');
     persistenceConflict = Boolean(result?.conflict);
     if (persistenceConflict && logger) {
       logger.logEvent('warn', 'persistence_conflict', {
@@ -400,7 +455,9 @@ function createGatewayRouter(options = {}) {
       tpmPaceMaxWaitMs: resolved.tpmPaceMaxWaitMs,
       tpmPaceDelayMs: resolved.tpmPaceDelayMs,
       tpmReserveTtlMs: resolved.tpmReserveTtlMs,
-      migrationMaxInputTokens: migrationMaxInputTokens != null ? Number(migrationMaxInputTokens) : resolved.migrationMaxInputTokens
+      migrationMaxInputTokens: migrationMaxInputTokens != null ? Number(migrationMaxInputTokens) : resolved.migrationMaxInputTokens,
+      internalErrorRetryLimit: resolved.internalErrorRetryLimit,
+      hashIgnorePrefixes: Array.isArray(resolved.hashIgnorePrefixes) ? resolved.hashIgnorePrefixes : []
     };
   }
 
@@ -479,8 +536,8 @@ function createGatewayRouter(options = {}) {
       return { ...upstream, tpmAvoided: false };
     };
 
-    const skipToFrok = (waitMs, decision) => {
-      logger.logEvent('info', 'tpm_pacing_skipped_frok', {
+    const skipToClone = (waitMs, decision) => {
+      logger.logEvent('info', 'tpm_pacing_skipped_clone', {
         requestId,
         waitMs: Number.isFinite(waitMs) ? waitMs : null,
         needed,
@@ -502,10 +559,10 @@ function createGatewayRouter(options = {}) {
     const maxWait = Number(settings.tpmPaceMaxWaitMs);
     let waitMs = tpmTracker.timeUntilFits(upstream.row.id, needed, { limitTpm: limit });
     if (needed > limit || waitMs === Infinity) {
-      return skipToFrok(waitMs, 'frok_oversize');
+      return skipToClone(waitMs, 'clone_oversize');
     }
     if (!(waitMs <= maxWait)) {
-      return skipToFrok(waitMs, 'frok_timeout');
+      return skipToClone(waitMs, 'clone_timeout');
     }
 
     if (waitMs > 0) {
@@ -522,7 +579,7 @@ function createGatewayRouter(options = {}) {
         tpmPaceLimit: limit,
         upstreamKeyId: upstream.row.id
       });
-      if (stream) {
+      if (stream && res.headersSent) {
         try { res.write(`: tpm_pacing wait_ms=${sleepMs}\n\n`); } catch {}
       } else {
         disableTimeouts(req, res);
@@ -530,10 +587,10 @@ function createGatewayRouter(options = {}) {
       await sleepAbortable(sleepMs, req);
       waitMs = tpmTracker.timeUntilFits(upstream.row.id, needed, { limitTpm: limit });
       if (needed > limit || waitMs === Infinity) {
-        return skipToFrok(waitMs, 'frok_oversize');
+        return skipToClone(waitMs, 'clone_oversize');
       }
       if (!(waitMs <= maxWait)) {
-        return skipToFrok(waitMs, 'frok_timeout');
+        return skipToClone(waitMs, 'clone_timeout');
       }
       if (waitMs > 0) {
         const extraSleep = Math.min(
@@ -557,7 +614,7 @@ function createGatewayRouter(options = {}) {
         });
       }
       if (!reserveId) {
-        return skipToFrok(waitMs, !(waitMs <= maxWait) ? 'frok_timeout' : 'frok_oversize');
+        return skipToClone(waitMs, !(waitMs <= maxWait) ? 'clone_timeout' : 'clone_oversize');
       }
     }
 
@@ -571,6 +628,7 @@ function createGatewayRouter(options = {}) {
   }
 
   applyTpmSettings();
+  const internalErrorCircuit = new InternalErrorCircuit();
   const lockManager = createSessionLockManager({
     defaultTimeoutMs: sessionLockTimeoutMs,
     defaultQueueLimit: sessionQueueLimit,
@@ -597,9 +655,15 @@ function createGatewayRouter(options = {}) {
   }
 
   function sendUpstreamError(res, protocol, error) {
+    if (isInternalError(error) || error?.code === 'INTERNAL') {
+      const rewritten = rewriteInternalError(error);
+      if (protocol === 'gemini') sendJson(res, 400, geminiError(400, rewritten.message, 'INTERNAL').body);
+      else sendJson(res, 400, openaiError(400, rewritten.message, 'INTERNAL', 'invalid_request_error').body);
+      return;
+    }
     const status = error.status && error.status >= 400 ? error.status : 502;
     if (protocol === 'gemini') sendJson(res, status, geminiError(status, error.message, 'INTERNAL').body);
-    else sendJson(res, status, openaiError(status, error.message, error.code || 'upstream_error', 'api_error').body);
+    else sendJson(res, status, openaiError(status, error.message, error.code || 'upstream_error', error.type || 'api_error').body);
   }
 
   function replayDuplicateCompletedTurn({
@@ -610,9 +674,10 @@ function createGatewayRouter(options = {}) {
     messages,
     requestId,
     conversationKey,
-    endpoint = '/v1/chat/completions'
+    endpoint = '/v1/chat/completions',
+    hashIgnorePrefixes = []
   }) {
-    if (!isDuplicateCompletedTurn(messages, stored)) return false;
+    if (!isDuplicateCompletedTurn(messages, stored, hashIgnorePrefixes)) return false;
 
     const token = req.gatewayToken;
     const startedAt = Date.now();
@@ -726,7 +791,7 @@ function createGatewayRouter(options = {}) {
       ...migrated,
       mode: originalMode && originalMode !== 'migrate' ? originalMode : 'continue',
       conversationMode: originalMode && originalMode !== 'migrate' ? originalMode : 'continue',
-      upstreamTransition: 'frok',
+      upstreamTransition: 'clone',
       contextRebuildReason: reason,
       sourceUpstreamKeyId: boundId || null,
       parentConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
@@ -770,6 +835,41 @@ function createGatewayRouter(options = {}) {
       logger,
       requestId
     );
+    let logSettled = false;
+
+    function markLogSettled() {
+      logSettled = true;
+    }
+
+    function finishPendingLog(patch) {
+      if (logSettled) return;
+      try {
+        const existing = database.getGatewayRequestLog(requestId);
+        if (existing && existing.status !== 'pending') {
+          markLogSettled();
+          return;
+        }
+        database.updateGatewayRequestLog(requestId, patch);
+        markLogSettled();
+      } catch {}
+    }
+
+    const onClientGone = () => {
+      finishPendingLog({
+        status: 'error',
+        errorCode: 'client_disconnected',
+        errorMessage: 'client disconnected',
+        durationMs: Date.now() - startedAt
+      });
+    };
+    if (req && typeof req.on === 'function') {
+      req.on('aborted', onClientGone);
+    }
+    if (req?.socket && typeof req.socket.on === 'function') {
+      req.socket.on('close', () => {
+        if (clientDisconnected(req)) onClientGone();
+      });
+    }
 
     // Record initial request log
     try {
@@ -802,10 +902,17 @@ function createGatewayRouter(options = {}) {
         rawCallMarkerCount: callMarkers.count,
         toolTraceStatus: conversation.toolTraceStatus || (callMarkers.suspectedModelGenerated ? 'suspected_model_generated' : 'none')
       });
-      mergeRequestDiagnostics(database, requestId, neededDiagnostics(neededInfo, conversation));
+      mergeRequestDiagnostics(database, requestId, {
+        ...neededDiagnostics(neededInfo, conversation),
+        ...(conversation.hashIgnoreApplied ? {
+          hashIgnoreApplied: true,
+          hashIgnoreHits: conversation.hashIgnoreHits || []
+        } : {})
+      });
     } catch {}
 
-    if (stream) {
+    function beginStream() {
+      if (!stream || streamed) return;
       disableTimeouts(req, res);
       stopHeartbeat = startSse(res);
       streamed = true;
@@ -818,6 +925,43 @@ function createGatewayRouter(options = {}) {
         }));
       }
       try { res.write(': antigravity sandbox starting\n\n'); } catch {}
+    }
+
+    if (conversation.mode === 'fork') {
+      internalErrorCircuit.clearConversation(conversation.sourceConversationKey || conversation.conversationKey);
+      internalErrorCircuit.clearConversation(conversation.conversationKey);
+    }
+
+    const circuitConversationKey = conversation.targetConversationKey || conversation.conversationKey;
+    const circuitInteractionId = conversation.previousInteractionId || conversation.sourcePreviousInteractionId || null;
+    if (conversation.mode !== 'fork'
+      && internalErrorCircuit.isOpen(circuitConversationKey, circuitInteractionId, settings.internalErrorRetryLimit)) {
+      const hits = internalErrorCircuit.snapshot(circuitConversationKey, circuitInteractionId);
+      const fail = rewriteInternalError();
+      logger.logEvent('warn', 'internal_error_circuit', {
+        requestId,
+        conversationKey: circuitConversationKey,
+        previousInteractionId: circuitInteractionId,
+        internalErrorHits: hits.count,
+        internalErrorCircuit: true
+      });
+      persistFailure({ database, token, resolved, endpoint, startedAt, error: fail });
+      try {
+        database.updateGatewayRequestLog(requestId, {
+          status: 'error',
+          errorMessage: fail.message,
+          errorCode: 'INTERNAL',
+          upstreamResponseStatus: 400,
+          durationMs: Date.now() - startedAt
+        });
+        mergeRequestDiagnostics(database, requestId, {
+          internalErrorHits: hits.count,
+          internalErrorCircuit: true
+        });
+        markLogSettled();
+      } catch {}
+      sendUpstreamError(res, protocol, fail);
+      return;
     }
 
     try {
@@ -973,8 +1117,11 @@ function createGatewayRouter(options = {}) {
                 payload,
                 proxyUrl: upstream.proxyUrl,
                 stream: true,
+                onStreamReady: async () => beginStream(),
                 onEvent: async (event) => {
+                  if (logSettled || clientDisconnected(req)) return;
                   state = applyStreamEvent(event, state);
+                  if (state.upstreamError) return;
                   const eventType = event?.event_type || event?.type;
                   if (eventType === 'step.start' && event.step?.type) {
                     try { res.write(`: step ${event.step.type} ${event.step.name || ''}\n\n`); } catch {}
@@ -995,6 +1142,15 @@ function createGatewayRouter(options = {}) {
                   }
                 }
               });
+              if (logSettled || clientDisconnected(req)) {
+                if (reserveId) {
+                  tpmTracker.cancelReservation(reserveId);
+                  reserveId = null;
+                }
+                onClientGone();
+                return;
+              }
+              if (state.upstreamError) throw state.upstreamError;
               const data = finalizeStreamState(state);
               if (!data.id && result?.events?.length) {
                 const last = result.events[result.events.length - 1];
@@ -1002,6 +1158,7 @@ function createGatewayRouter(options = {}) {
               }
               const usage = usageFromInteraction(data);
               reserveId = settleTpmUsage(upstream.row.id, usage.totalTokens, reserveId);
+              internalErrorCircuit.clearConversation(conversationForCall.targetConversationKey || conversationForCall.conversationKey);
               persistSuccess({
                 database,
                 token,
@@ -1028,6 +1185,7 @@ function createGatewayRouter(options = {}) {
                   durationMs: Date.now() - startedAt,
                   status: 'success'
                 });
+                markLogSettled();
               } catch {}
               logger.logEvent('info', 'interaction_response', {
                 requestId,
@@ -1038,7 +1196,7 @@ function createGatewayRouter(options = {}) {
                 responseStatus: data.status,
                 stream: true
               });
-              if (conversationForCall.upstreamTransition === 'frok') {
+              if (isCloneTransition(conversationForCall.upstreamTransition)) {
                 logger.logEvent('info', 'context_rebuild_completed', {
                   requestId,
                   conversationKey: conversationForCall.conversationKey,
@@ -1048,7 +1206,7 @@ function createGatewayRouter(options = {}) {
                   environmentId: data.environment_id,
                   contextRebuildReason: conversationForCall.contextRebuildReason,
                   conversationMode: conversationForCall.mode,
-                  upstreamTransition: 'frok'
+                  upstreamTransition: 'clone'
                 });
               }
               if (protocol === 'openai') {
@@ -1079,8 +1237,17 @@ function createGatewayRouter(options = {}) {
               proxyUrl: upstream.proxyUrl,
               stream: false
             });
+            if (logSettled || clientDisconnected(req)) {
+              if (reserveId) {
+                tpmTracker.cancelReservation(reserveId);
+                reserveId = null;
+              }
+              onClientGone();
+              return;
+            }
             const usage = usageFromInteraction(data);
             reserveId = settleTpmUsage(upstream.row.id, usage.totalTokens, reserveId);
+            internalErrorCircuit.clearConversation(conversationForCall.targetConversationKey || conversationForCall.conversationKey);
             persistSuccess({
               database,
               token,
@@ -1107,6 +1274,7 @@ function createGatewayRouter(options = {}) {
                 durationMs: Date.now() - startedAt,
                 status: 'success'
               });
+              markLogSettled();
             } catch {}
             logger.logEvent('info', 'interaction_response', {
               requestId,
@@ -1117,7 +1285,7 @@ function createGatewayRouter(options = {}) {
               responseStatus: data.status,
               stream: false
             });
-            if (conversationForCall.upstreamTransition === 'frok') {
+            if (isCloneTransition(conversationForCall.upstreamTransition)) {
               logger.logEvent('info', 'context_rebuild_completed', {
                 requestId,
                 conversationKey: conversationForCall.conversationKey,
@@ -1127,7 +1295,7 @@ function createGatewayRouter(options = {}) {
                 environmentId: data.environment_id,
                 contextRebuildReason: conversationForCall.contextRebuildReason,
                 conversationMode: conversationForCall.mode,
-                upstreamTransition: 'frok'
+                upstreamTransition: 'clone'
               });
             }
             if (protocol === 'openai') {
@@ -1144,6 +1312,60 @@ function createGatewayRouter(options = {}) {
             return;
           } catch (error) {
             lastError = error;
+            if (error.code === 'client_disconnected') {
+              if (reserveId) {
+                tpmTracker.cancelReservation(reserveId);
+                reserveId = null;
+              }
+              onClientGone();
+              try { res.destroy(); } catch {}
+              return;
+            }
+            if (isInternalError(error)) {
+              const fail = rewriteInternalError(error);
+              lastError = fail;
+              if (reserveId) {
+                tpmTracker.cancelReservation(reserveId);
+                reserveId = null;
+              }
+              const hit = internalErrorCircuit.record(
+                conversationForCall.targetConversationKey || conversationForCall.conversationKey,
+                conversationForCall.previousInteractionId || conversation.previousInteractionId || null
+              );
+              database.markUpstreamKeyUsed(upstream.row.id, { failed: true });
+              persistFailure({ database, token, resolved, endpoint, startedAt, error: fail });
+              try {
+                database.updateGatewayRequestLog(requestId, {
+                  status: 'error',
+                  errorMessage: fail.message,
+                  errorCode: 'INTERNAL',
+                  upstreamResponseStatus: 400,
+                  upstreamResponseJson: sanitizeForStorage(error.rawError || { error: { message: fail.message, code: 'INTERNAL', status: 400 } }),
+                  durationMs: Date.now() - startedAt
+                });
+                mergeRequestDiagnostics(database, requestId, {
+                  internalErrorHits: hit.count,
+                  internalErrorCircuit: false
+                });
+                markLogSettled();
+              } catch {}
+              logger.logEvent('error', 'interaction_error', {
+                requestId,
+                endpoint,
+                message: fail.message,
+                code: 'INTERNAL',
+                status: 400,
+                isRateLimit: false,
+                internalErrorHits: hit.count
+              });
+              if (streamed) {
+                writeSse(res, { error: { message: fail.message, type: 'invalid_request_error', code: 'INTERNAL' } });
+                writeSse(res, '[DONE]');
+                return;
+              }
+              sendUpstreamError(res, protocol, fail);
+              return;
+            }
             if (!isRateLimitError(error)) {
               if (reserveId) {
                 tpmTracker.cancelReservation(reserveId);
@@ -1160,6 +1382,7 @@ function createGatewayRouter(options = {}) {
                   upstreamResponseJson: sanitizeForStorage(error.rawError || { error: { message: error.message, code: error.code, status: error.status } }),
                   durationMs: Date.now() - startedAt
                 });
+                markLogSettled();
               } catch {}
               logger.logEvent('error', 'interaction_error', {
                 requestId,
@@ -1230,6 +1453,7 @@ function createGatewayRouter(options = {}) {
           upstreamResponseJson: sanitizeForStorage(fail.rawError || { error: { message: fail.message, code: fail.code, status: fail.status } }),
           durationMs: Date.now() - startedAt
         });
+        markLogSettled();
       } catch {}
       logger.logEvent('error', 'all_keys_exhausted', {
         requestId,
@@ -1244,6 +1468,14 @@ function createGatewayRouter(options = {}) {
       }
       sendUpstreamError(res, protocol, fail);
     } finally {
+      if (!logSettled) {
+        finishPendingLog({
+          status: 'error',
+          errorCode: clientDisconnected(req) ? 'client_disconnected' : 'abandoned',
+          errorMessage: clientDisconnected(req) ? 'client disconnected' : 'request ended while pending',
+          durationMs: Date.now() - startedAt
+        });
+      }
       if (streamed) {
         stopHeartbeat();
         res.end();
@@ -1307,7 +1539,14 @@ function createGatewayRouter(options = {}) {
     }
 
     try {
-      const stored = resolveStoredConversation(database, token.id, conversationKey, req.body.messages);
+      const settings = currentSettings();
+      const stored = resolveStoredConversation(
+        database,
+        token.id,
+        conversationKey,
+        req.body.messages,
+        settings.hashIgnorePrefixes
+      );
       if (replayDuplicateCompletedTurn({
         req,
         res,
@@ -1316,7 +1555,8 @@ function createGatewayRouter(options = {}) {
         messages: req.body.messages,
         requestId,
         conversationKey,
-        endpoint: '/v1/chat/completions'
+        endpoint: '/v1/chat/completions',
+        hashIgnorePrefixes: settings.hashIgnorePrefixes
       })) {
         return;
       }
@@ -1328,7 +1568,8 @@ function createGatewayRouter(options = {}) {
         resolveCallId: (id) => database.resolveGoogleCallId(id),
         requestId,
         sourceConversationKey: conversationKey,
-        maxInputTokens: currentSettings().migrationMaxInputTokens
+        maxInputTokens: settings.migrationMaxInputTokens,
+        hashIgnorePrefixes: settings.hashIgnorePrefixes
       });
       const tools = mergeTools({ body: req.body, headers: req.headers, tokenConfig: token });
       await runInteraction({

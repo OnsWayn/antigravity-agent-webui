@@ -474,6 +474,9 @@ test('admin settings expose and update TPM limits', async () => {
     });
     assert.equal(getRes.status, 200);
     assert.equal(getRes.json.settings.tpmLimit, 100000);
+    assert.equal(getRes.json.settings.tpmStrategy, 'clone');
+    assert.equal(getRes.json.settings.internalErrorRetryLimit, 2);
+    assert.deepEqual(getRes.json.settings.hashIgnorePrefixes, ['<RAG-Faiss-Memory>']);
 
     const patchRes = await request(base, '/api/gateway/settings', {
       method: 'PATCH',
@@ -489,7 +492,7 @@ test('admin settings expose and update TPM limits', async () => {
   });
 });
 
-test('settings PATCH round-trips pace fields, TTL, and invalid strategy falls back to frok', async () => {
+test('settings PATCH round-trips pace fields, TTL, and invalid strategy keeps the previous value', async () => {
   await withApp(async () => ({}), async ({ base, adminToken }) => {
     const patchRes = await request(base, '/api/gateway/settings', {
       method: 'PATCH',
@@ -765,6 +768,10 @@ test('pace froks immediately when estimated wait exceeds maxWait', async () => {
     assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: second })).status, 200);
     assert.ok(Date.now() - started < 2000);
     assert.equal(payloads[1].previous_interaction_id, undefined);
+    const { logs } = database.listGatewayRequestLogs({ limit: 5 });
+    assert.equal(logs[0].upstream_transition, 'clone');
+    const diag = parseDiagnostics(logs[0]);
+    assert.equal(diag.tpmPacingDecision, 'clone_timeout');
   });
 });
 
@@ -815,7 +822,9 @@ test('pace new request with a large inline image does not frok_oversize', async 
     assert.equal(payloads[0].previous_interaction_id, undefined);
     const { logs } = database.listGatewayRequestLogs({ limit: 5 });
     const diag = parseDiagnostics(logs[0]);
+    assert.notEqual(diag.tpmPacingDecision, 'clone_oversize');
     assert.notEqual(diag.tpmPacingDecision, 'frok_oversize');
+    assert.notEqual(logs[0].upstream_transition, 'clone');
     assert.notEqual(logs[0].upstream_transition, 'frok');
     assert.ok(diag.neededTokens < 20000, `neededTokens=${diag.neededTokens}`);
     assert.ok(diag.estimatedImageCount >= 1);
@@ -886,6 +895,251 @@ test('fork then continue uses logged usage for neededSource and does not frok_ov
     const diag = parseDiagnostics(continueLog);
     assert.match(String(diag.neededSource || ''), /^log:/);
     assert.ok(diag.neededTokens < 100000, `neededTokens=${diag.neededTokens}`);
+    assert.notEqual(diag.tpmPacingDecision, 'clone_oversize');
     assert.notEqual(diag.tpmPacingDecision, 'frok_oversize');
+  });
+});
+
+test('stored frok strategy is normalized to clone on GET', async () => {
+  await withApp(async () => ({}), async ({ base, adminToken, database }) => {
+    database.setGatewaySettings({ tpmStrategy: 'frok' });
+    const getRes = await request(base, '/api/gateway/settings', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(getRes.status, 200);
+    assert.equal(getRes.json.settings.tpmStrategy, 'clone');
+  });
+});
+
+test('PATCH hashIgnorePrefixes round-trips and rejects empty or oversized lists', async () => {
+  await withApp(async () => ({}), async ({ base, adminToken }) => {
+    const ok = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { hashIgnorePrefixes: '<RAG-Faiss-Memory>\n<system_reminder>' }
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.json.settings.hashIgnorePrefixes, ['<RAG-Faiss-Memory>', '<system_reminder>']);
+
+    const empty = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { hashIgnorePrefixes: '' }
+    });
+    assert.equal(empty.status, 400);
+    assert.equal(empty.json.error.code, 'invalid_settings');
+
+    const tooLong = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { hashIgnorePrefixes: ['x'.repeat(201)] }
+    });
+    assert.equal(tooLong.status, 400);
+
+    const tooMany = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { hashIgnorePrefixes: Array.from({ length: 33 }, (_, i) => `p${i}`) }
+    });
+    assert.equal(tooMany.status, 400);
+  });
+});
+
+test('consecutive Internal error trips a session circuit and returns HTTP 400', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    const error = new Error('Internal error encountered.');
+    error.status = 500;
+    error.code = 'api_error';
+    throw error;
+  }, async ({ base, database, masterKey }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'internal-session';
+    const body = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hello' }] };
+    const first = await request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    assert.equal(first.status, 400);
+    assert.equal(first.json.error.code, 'INTERNAL');
+    assert.equal(first.json.error.type, 'invalid_request_error');
+    assert.match(first.json.error.message, /Internal error encountered/i);
+    const second = await request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    assert.equal(second.status, 400);
+    const third = await request(base, '/v1/chat/completions', { method: 'POST', headers, body });
+    assert.equal(third.status, 400);
+    assert.equal(calls, 2);
+    const { logs } = database.listGatewayRequestLogs({ limit: 10 });
+    const circuitLog = logs.find((row) => parseDiagnostics(row).internalErrorCircuit) || logs[0];
+    assert.equal(parseDiagnostics(circuitLog).internalErrorCircuit, true);
+    assert.equal(circuitLog.error_code, 'INTERNAL');
+  });
+});
+
+test('fork after Internal error clears the circuit', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    if (calls === 2 || calls === 3) {
+      const error = new Error('Internal error encountered.');
+      error.status = 500;
+      error.code = 'INTERNAL';
+      throw error;
+    }
+    return {
+      id: `int-clear-${calls}`,
+      status: 'completed',
+      environment_id: 'env-clear',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 11 }
+    };
+  }, async ({ base, database, masterKey }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'internal-fork-session';
+    const first = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hello' }] };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: first })).status, 200);
+    const continued = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'next' }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: continued })).status, 400);
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: continued })).status, 400);
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: continued })).status, 400);
+    assert.equal(calls, 3);
+    const forked = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: 'CHANGED' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'new question' }
+      ]
+    };
+    const res = await request(base, '/v1/chat/completions', { method: 'POST', headers, body: forked });
+    assert.equal(res.status, 200);
+    assert.equal(calls, 4);
+  });
+});
+
+test('429 still rotates keys and is not treated as Internal error', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    if (calls <= 3) {
+      const error = new Error('Resource exhausted');
+      error.status = 429;
+      error.code = 'RESOURCE_EXHAUSTED';
+      throw error;
+    }
+    return {
+      id: `int-429-${calls}`,
+      status: 'completed',
+      environment_id: 'env-429',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 11 }
+    };
+  }, async ({ base, database, masterKey }) => {
+    const { headers } = seedGatewayClient(database, masterKey, { keys: ['secret-a', 'secret-b'] });
+    headers['x-session-id'] = 'rate-session';
+    const res = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hi' }] }
+    });
+    assert.equal(res.status, 200);
+    assert.ok(calls >= 4);
+  });
+});
+
+test('hash ignore diagnostics record hits and keep continue for RAG injection', async () => {
+  const payloads = [];
+  await withApp(async ({ payload }) => {
+    payloads.push(payload);
+    return {
+      id: `int-rag-${payloads.length}`,
+      status: 'completed',
+      environment_id: `env-rag-${payloads.length}`,
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 20 }
+    };
+  }, async ({ base, database, masterKey }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'rag-session';
+    const rag = '<RAG-Faiss-Memory>\n--- BEGIN HISTORICAL MEMORY REFERENCE ---\nstuff';
+    const first = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: `hello\n${rag}` }] }
+    });
+    assert.equal(first.status, 200);
+    const second = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'gemini-3.7-flash',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: `next\n${rag}` }
+        ]
+      }
+    });
+    assert.equal(second.status, 200);
+    assert.equal(payloads[1].previous_interaction_id, 'int-rag-1');
+    assert.match(String(payloads[1].input), /RAG-Faiss-Memory/);
+    const { logs } = database.listGatewayRequestLogs({ limit: 5 });
+    const continueLog = logs.find((row) => row.conversation_mode === 'continue');
+    assert.ok(continueLog);
+    const diag = parseDiagnostics(continueLog);
+    assert.equal(diag.hashIgnoreApplied, true);
+    assert.ok(Array.isArray(diag.hashIgnoreHits) && diag.hashIgnoreHits.includes('<RAG-Faiss-Memory>'));
+  });
+});
+
+test('abort during a hung upstream call marks the log client_disconnected', async () => {
+  await withApp(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return {
+      id: 'int-hang',
+      status: 'completed',
+      environment_id: 'env-hang',
+      output_text: 'late',
+      steps: [],
+      usage: { total_tokens: 1 }
+    };
+  }, async ({ base, database, masterKey }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'hang-session';
+    await new Promise((resolve) => {
+      const url = new URL('/v1/chat/completions', base);
+      const payload = Buffer.from(JSON.stringify({
+        model: 'gemini-3.7-flash',
+        messages: [{ role: 'user', content: 'hang' }]
+      }));
+      const req = http.request(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': payload.length,
+          ...headers
+        }
+      }, () => {});
+      req.on('error', () => resolve());
+      req.write(payload);
+      req.end();
+      setTimeout(() => {
+        req.destroy();
+        resolve();
+      }, 80);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const { logs } = database.listGatewayRequestLogs({ limit: 5 });
+    assert.ok(logs.length >= 1);
+    assert.notEqual(logs[0].status, 'pending');
+    assert.equal(logs[0].error_code, 'client_disconnected');
   });
 });

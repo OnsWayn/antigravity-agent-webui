@@ -7,6 +7,7 @@ const {
   estimateTokenBreakdown,
   estimateTokens,
   hashNonAssistant,
+  stripIgnoredPrefixes,
   mergeTools,
   openaiMessageToInputParts,
   parseImageRef,
@@ -338,7 +339,7 @@ test('summarizeToolHistory keeps call ids and never emits [Calls:] templates', (
     conversationKey: 'hdr:qq:1'
   }, { messages });
   assert.equal(migrated.mode, 'migrate');
-  assert.equal(migrated.upstreamTransition, 'frok');
+  assert.equal(migrated.upstreamTransition, 'clone');
   const migratedText = JSON.stringify(migrated.input);
   assert.doesNotMatch(migratedText, /\[Calls:/);
   assert.match(migratedText, /NEW sandbox/);
@@ -465,6 +466,140 @@ test('buildSafeHistoryInput keeps only the last copy of a replayed image', () =>
   assert.equal(countInputImages(rebuilt.input), 1);
   const text = JSON.stringify(rebuilt.input);
   assert.match(text, /see this/);
+});
+
+const RAG_BLOCK = '<RAG-Faiss-Memory>\n--- BEGIN HISTORICAL MEMORY REFERENCE ---\nlong memory';
+
+test('hash ignore prefixes keep continue when last user injects then drops memory', () => {
+  const prefixes = ['<RAG-Faiss-Memory>'];
+  const first = [{ role: 'user', content: `short question\n${RAG_BLOCK}` }];
+  const firstTurn = buildOpenAIConversation({ messages: first, hashIgnorePrefixes: prefixes });
+  assert.equal(firstTurn.mode, 'new');
+  assert.equal(firstTurn.hashIgnoreApplied, true);
+  assert.deepEqual(firstTurn.hashIgnoreHits, prefixes);
+  assert.match(String(firstTurn.input), /RAG-Faiss-Memory/);
+
+  const continued = buildOpenAIConversation({
+    messages: [
+      { role: 'user', content: 'short question' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: `next line\n${RAG_BLOCK}` }
+    ],
+    stored: {
+      interaction_id: 'int-rag',
+      environment_id: 'env-rag',
+      prefix_hash: firstTurn.nextPrefixHash
+    },
+    hashIgnorePrefixes: prefixes
+  });
+  assert.equal(continued.mode, 'continue');
+  assert.equal(continued.previousInteractionId, 'int-rag');
+  assert.match(String(continued.input), /next line/);
+  assert.match(String(continued.input), /RAG-Faiss-Memory/);
+});
+
+test('empty hash ignore list still forks the same injection pattern', () => {
+  const first = [{ role: 'user', content: `short question\n${RAG_BLOCK}` }];
+  const firstTurn = buildOpenAIConversation({ messages: first, hashIgnorePrefixes: [] });
+  const forked = buildOpenAIConversation({
+    messages: [
+      { role: 'user', content: 'short question' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'next line' }
+    ],
+    stored: {
+      interaction_id: 'int-rag',
+      environment_id: 'env-rag',
+      prefix_hash: firstTurn.nextPrefixHash
+    },
+    hashIgnorePrefixes: []
+  });
+  assert.equal(forked.mode, 'fork');
+});
+
+test('hash ignore does not hide a real early-user edit', () => {
+  const prefixes = ['<RAG-Faiss-Memory>'];
+  const storedHash = hashNonAssistant([
+    { role: 'user', content: 'hello' }
+  ], prefixes);
+  const edited = buildOpenAIConversation({
+    messages: [
+      { role: 'user', content: 'CHANGED' },
+      { role: 'assistant', content: 'hi' },
+      { role: 'user', content: `next\n${RAG_BLOCK}` }
+    ],
+    stored: {
+      interaction_id: 'int-1',
+      environment_id: 'env-1',
+      prefix_hash: storedHash
+    },
+    hashIgnorePrefixes: prefixes
+  });
+  assert.equal(edited.mode, 'fork');
+});
+
+test('hash ignore still continues when only the system prompt changes', () => {
+  const prefixes = ['<RAG-Faiss-Memory>'];
+  const storedHash = hashNonAssistant([
+    { role: 'system', content: 'sys v1' },
+    { role: 'user', content: 'hello' }
+  ], prefixes);
+  const continued = buildOpenAIConversation({
+    messages: [
+      { role: 'system', content: 'sys v2' },
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'hi' },
+      { role: 'user', content: 'next' }
+    ],
+    stored: {
+      interaction_id: 'int-1',
+      environment_id: 'env-1',
+      prefix_hash: storedHash
+    },
+    hashIgnorePrefixes: prefixes
+  });
+  assert.equal(continued.mode, 'continue');
+});
+
+test('custom hash ignore prefix is stripped the same way', () => {
+  const prefixes = ['<<MEM>>'];
+  const a = hashNonAssistant([{ role: 'user', content: 'hello <<MEM>> secret' }], prefixes);
+  const b = hashNonAssistant([{ role: 'user', content: 'hello' }], prefixes);
+  assert.equal(a, b);
+});
+
+test('closed ignore tags keep the trailing tail', () => {
+  const prefixes = ['<RAG-Faiss-Memory>'];
+  const withClose = 'hello <RAG-Faiss-Memory>xxx</RAG-Faiss-Memory> tail';
+  assert.equal(stripIgnoredPrefixes(withClose, prefixes), 'hello  tail');
+  const a = hashNonAssistant([{ role: 'user', content: withClose }], prefixes);
+  const b = hashNonAssistant([{ role: 'user', content: 'hello  tail' }], prefixes);
+  assert.equal(a, b);
+});
+
+test('tool-result turns continue when injected user text is unchanged after strip', () => {
+  const prefixes = ['<RAG-Faiss-Memory>'];
+  const user = { role: 'user', content: `weather?\n${RAG_BLOCK}` };
+  const assistant = {
+    role: 'assistant',
+    content: null,
+    tool_calls: [{ id: 'call_1', function: { name: 'get_weather' } }]
+  };
+  const first = buildOpenAIConversation({
+    messages: [user],
+    hashIgnorePrefixes: prefixes
+  });
+  const toolTurn = buildOpenAIConversation({
+    messages: [user, assistant, { role: 'tool', tool_call_id: 'call_1', name: 'get_weather', content: '{"ok":true}' }],
+    stored: {
+      interaction_id: 'int-2',
+      environment_id: 'env-2',
+      prefix_hash: first.nextPrefixHash
+    },
+    hashIgnorePrefixes: prefixes
+  });
+  assert.equal(toolTurn.mode, 'continue');
+  assert.equal(toolTurn.input[0].type, 'function_result');
 });
 
 test('over-budget plain text still drops oldest turns and keeps the last user', () => {

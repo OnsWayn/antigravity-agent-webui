@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.7.5] - 2026-09-02
+
+### Added
+
+- Session circuit for upstream `Internal error encountered`: after `internalErrorRetryLimit` consecutive hits (default 2) on the same conversation + `previous_interaction_id`, later requests skip Google and return HTTP **400** with `code: INTERNAL`. The first INTERNAL is also rewritten to 400 so OpenAI SDKs do not retry 500s. Success or a downstream `fork` clears the counter. Client disconnects no longer leave `pending` log rows.
+- Configurable `hashIgnorePrefixes` (default `["<RAG-Faiss-Memory>"]`). `prefix_hash` strips these literal injection blocks so clients that attach then drop plugin memory on the last user turn can `continue` instead of forking every round. Upstream payload is unchanged. WebUI 「会话哈希」 card edits the list without a code change.
+
+### Changed
+
+- Upstream key-rotation rebuild is named `clone` (old name `frok`). New writes use `clone`; env/settings `frok` still load as `clone`. Downstream `fork` is unchanged. Log dashboard displays historical `frok` rows as `clone`.
+- Stream responses start SSE only after upstream HTTP 2xx. Embedded SSE `error` / `failed` events throw instead of being persisted as success.
+
+## [1.7.4] - 2026-08-31
+
+### Fixed
+
+- Inline images are no longer tokenized as `JSON.stringify(input).length / 4`. `estimateTokens` walks structured input, reads JPEG/PNG/GIF/WebP headers, and estimates Gemini visual tokens (about 1k–3k per image, hard-capped at 8000). This stops pace from false-`frok_oversize` on a round that is actually ~9k tokens.
+- Fork / frok history rebuild drops oldest **turns**, never a single leftover image part, and always keeps the latest user turn (text + every image). Replayed copies of the same image fingerprint are collapsed to one.
+- Pace `needed` looks up the latest success `total_tokens` across conversation / target / source / parent keys before falling back to the visual estimate. `diagnostics_json` now records `neededTokens`, `neededSource` (`log:<key>` / `estimate` / `zero`), and image estimate counts.
+
 ## [1.7.3] - 2026-08-28
 
 ### Added

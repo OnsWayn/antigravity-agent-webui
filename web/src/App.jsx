@@ -543,7 +543,7 @@ export default function App() {
 
             {tab === 'docs' && (
               <section className="box markdown">
-                <h3>Antigravity Studio v1.7.4</h3>
+                <h3>Antigravity Studio v1.7.5</h3>
                 <p>本系统以 <b>协议中转站 (Protocol Gateway)</b> 与 <b>独立日志控制台 (Log Dashboard)</b> 为核心，同时集成 Google Interactions 远程沙盒调试能力。</p>
                 <h4>对外模型规范</h4>
                 <p>下游客户端 (Cursor / Cline / QQ 机器人 / OpenAI SDK / LangChain 等) 请求时：</p>
@@ -553,7 +553,7 @@ export default function App() {
                   <li><code>自定义模型名称</code> — 支持在客户端直接指定任意 Gemini 模型 (如 gemini-3.1-pro-preview)，网关自动 pass-through</li>
                 </ul>
                 <h4>高可用与 TPM 策略</h4>
-                <p>默认策略是立即 frok：60 秒窗口、100k 上限、80% 触发比例，粘性会话到达阈值或遭遇 429 时，用不可执行的工具摘要重建上下文并切换到新 Key。也可改为排队等待：只有「本轮预估 + 窗口内已有用量」严格小于 TPM 窗口才立刻上传，否则同一把 Key 上等待腾额度；预计等待超过最长等待仍 frok。每把上游 Key 显示本分钟 / 今日调用次数，今日次数按洛杉矶午夜（与 Google AI Studio RPD 一致）清零。</p>
+                <p>默认策略是立即 clone（克隆到新 Key）：60 秒窗口、100k 上限、80% 触发比例，粘性会话到达阈值或遭遇 429 时，用不可执行的工具摘要重建上下文并切换到新 Key。也可改为排队等待：只有「本轮预估 + 窗口内已有用量」严格小于 TPM 窗口才立刻上传，否则同一把 Key 上等待腾额度；预计等待超过最长等待仍 clone。fork 仍是下游历史对不上时的分叉，和 clone 不是一回事。会话哈希可配置忽略注入块，避免插件记忆导致假 fork。上游 Internal error 连续命中后熔断并回 HTTP 400，避免 SDK 把 500 自动重试成风暴。每把上游 Key 显示本分钟 / 今日调用次数，今日次数按洛杉矶午夜（与 Google AI Studio RPD 一致）清零。</p>
               </section>
             )}
           </div>
