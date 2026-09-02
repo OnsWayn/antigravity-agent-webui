@@ -33,7 +33,8 @@ const {
   observeCallMarkers,
   isDuplicateCompletedTurn,
   lastAssistantFromTranscript,
-  estimateTokens
+  estimateTokenBreakdown,
+  DEFAULT_IMAGE_TOKENS
 } = require('./translate');
 const { resolveGatewaySettings } = require('./settings');
 const { pacificDayKey, nextPacificMidnightMs } = require('./pacific-time');
@@ -154,13 +155,83 @@ function sleepAbortable(ms, req) {
   });
 }
 
+function conversationKeyCandidates(conversation) {
+  const keys = [];
+  const seen = new Set();
+  for (const key of [
+    conversation?.conversationKey,
+    conversation?.targetConversationKey,
+    conversation?.sourceConversationKey,
+    conversation?.parentConversationKey
+  ]) {
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
 function estimateNeededTokens(database, conversation) {
-  const fromLog = database && typeof database.getLatestSuccessTotalTokens === 'function'
-    ? database.getLatestSuccessTotalTokens(conversation?.conversationKey)
-    : null;
-  if (Number.isFinite(fromLog) && fromLog > 0) return fromLog;
-  const estimated = estimateTokens(conversation?.input);
-  return Number.isFinite(estimated) && estimated > 0 ? estimated : 0;
+  const breakdown = estimateTokenBreakdown(conversation?.input);
+  const info = {
+    needed: 0,
+    neededSource: 'zero',
+    estimatedInputTokens: breakdown.tokens,
+    estimatedImageTokens: breakdown.imageTokens,
+    estimatedImageCount: breakdown.imageCount
+  };
+  if (database && typeof database.getLatestSuccessTotalTokens === 'function') {
+    for (const key of conversationKeyCandidates(conversation)) {
+      const fromLog = database.getLatestSuccessTotalTokens(key);
+      if (Number.isFinite(fromLog) && fromLog > 0) {
+        return { ...info, needed: fromLog, neededSource: `log:${key}` };
+      }
+    }
+  }
+  const estimated = breakdown.tokens;
+  if (Number.isFinite(estimated) && estimated > 0) {
+    return { ...info, needed: estimated, neededSource: 'estimate' };
+  }
+  return info;
+}
+
+function capEstimatedNeeded(neededInfo, limit, logger, requestId) {
+  if (!neededInfo || neededInfo.neededSource !== 'estimate') return neededInfo;
+  const cap = Number(limit);
+  if (!(Number.isFinite(cap) && cap > 0 && neededInfo.needed > cap)) return neededInfo;
+  const imageCount = Number(neededInfo.estimatedImageCount) || 0;
+  if (!(imageCount > 0)) return neededInfo;
+  const textTokens = Math.max(0, (neededInfo.estimatedInputTokens || 0) - (neededInfo.estimatedImageTokens || 0));
+  const capped = textTokens + DEFAULT_IMAGE_TOKENS * imageCount;
+  if (!(capped <= cap)) return neededInfo;
+  if (logger) {
+    logger.logEvent('warn', 'tpm_needed_image_capped', {
+      requestId,
+      originalNeeded: neededInfo.needed,
+      cappedNeeded: capped,
+      imageCount
+    });
+  }
+  return { ...neededInfo, needed: capped, neededCapped: true };
+}
+
+function neededDiagnostics(neededInfo, conversation) {
+  const patch = {
+    neededTokens: neededInfo?.needed || 0,
+    neededSource: neededInfo?.neededSource || 'zero',
+    estimatedInputTokens: neededInfo?.estimatedInputTokens || 0,
+    estimatedImageTokens: neededInfo?.estimatedImageTokens || 0,
+    estimatedImageCount: neededInfo?.estimatedImageCount || 0
+  };
+  if (neededInfo?.neededCapped) patch.neededCapped = true;
+  if (conversation?.historyTruncated) {
+    patch.historyTruncated = true;
+    patch.keptTurns = conversation.keptTurns;
+    patch.droppedTurns = conversation.droppedTurns;
+    patch.imageCount = conversation.imageCount;
+    patch.estimatedTokens = conversation.estimatedInputTokens;
+  }
+  return patch;
 }
 
 function requireGatewayReady({ enabled, masterKey }) {
@@ -371,7 +442,8 @@ function createGatewayRouter(options = {}) {
     source,
     settings,
     requestId,
-    switchIndex
+    switchIndex,
+    neededInfo
   }) {
     const stickyId = conversation.upstreamKeyId || source.stored?.upstream_key_id || null;
     const stickyPace = settings.tpmStrategy === 'pace'
@@ -388,7 +460,7 @@ function createGatewayRouter(options = {}) {
       };
     }
 
-    const needed = estimateNeededTokens(database, conversation);
+    const needed = Number(neededInfo?.needed) || 0;
     const limit = settings.tpmPaceLimit;
     const pickAlt = () => {
       try {
@@ -692,6 +764,12 @@ function createGatewayRouter(options = {}) {
     const streamId = `chatcmpl_${Date.now()}`;
     const settings = applyTpmSettings();
     const callMarkers = conversation.callMarkers || observeCallMarkers(req.body);
+    const neededInfo = capEstimatedNeeded(
+      estimateNeededTokens(database, conversation),
+      settings.tpmPaceLimit,
+      logger,
+      requestId
+    );
 
     // Record initial request log
     try {
@@ -724,6 +802,7 @@ function createGatewayRouter(options = {}) {
         rawCallMarkerCount: callMarkers.count,
         toolTraceStatus: conversation.toolTraceStatus || (callMarkers.suspectedModelGenerated ? 'suspected_model_generated' : 'none')
       });
+      mergeRequestDiagnostics(database, requestId, neededDiagnostics(neededInfo, conversation));
     } catch {}
 
     if (stream) {
@@ -752,7 +831,7 @@ function createGatewayRouter(options = {}) {
             tpmTracker,
             strategy: settings.tpmStrategy,
             tpmPaceLimit: settings.tpmPaceLimit,
-            needed: estimateNeededTokens(database, conversation)
+            needed: neededInfo.needed
           });
         } catch (error) {
           lastError = error;
@@ -772,7 +851,8 @@ function createGatewayRouter(options = {}) {
             source,
             settings,
             requestId,
-            switchIndex
+            switchIndex,
+            neededInfo
           });
           upstream = paced.upstream;
           tpmAvoided = Boolean(paced.tpmAvoided);
@@ -797,15 +877,16 @@ function createGatewayRouter(options = {}) {
           break;
         }
 
-        if (tpmPacingDecision) {
-          try {
-            mergeRequestDiagnostics(database, requestId, {
+        try {
+          mergeRequestDiagnostics(database, requestId, {
+            ...neededDiagnostics(neededInfo, conversation),
+            ...(tpmPacingDecision ? {
               tpmStrategy: settings.tpmStrategy,
               tpmPaceWaitMs,
               tpmPacingDecision
-            });
-          } catch {}
-        }
+            } : {})
+          });
+        } catch {}
 
         if (switchIndex > 0) {
           logger.logEvent('warn', 'key_rotated', {

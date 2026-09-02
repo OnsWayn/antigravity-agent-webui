@@ -6,7 +6,7 @@ A high-performance **OpenAI / Gemini protocol gateway** and **management dashboa
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.7.3** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.7.4** · Node.js **22.5+** · License **Apache-2.0**
 
 > **Free-tier note.** Gemini / Antigravity free quota is about **100,000 TPM**. Use it as a lightweight chat API, not a high-throughput agent loop. On downstream tokens, turn off the three sandbox tools (code execution, Google Search, URL context) and let the caller's agent framework run tools instead.
 >
@@ -184,7 +184,7 @@ Set `GATEWAY_MASTER_KEY` and `GATEWAY_ADMIN_TOKEN` in `.env`, restart, then open
 
 The gateway always calls Interactions with `agent: "antigravity-preview-05-2026"` and `environment: "remote"` (or a reused environment id). `generateContent` is not used; Google returns 400 for that model. Allowed `agent_config.model` values are `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and `gemini-3.5-flash-lite`.
 
-Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s the gateway migrates conversation context onto another key with a **new** sandbox. The default TPM strategy (`frok`) also migrates when recent usage hits `limit × ratio`. The optional `pace` strategy keeps the sticky key and waits until `recent usage + this round` is strictly below the TPM window; if the wait would exceed `tpmPaceMaxWaitMs` it still froks. Downstream `conversation_mode` stays `continue`; the upstream hop is marked `frok` (key-rotation rebuild), not `new`. Tool history is sent as a non-executable summary (not `[Calls:]` templates) so the model cannot imitate fake tool traces.
+Multiple upstream Gemini keys are supported. New chats round-robin by least-recently-used key; a conversation sticks to the key that created its sandbox because `environment_id` / `previous_interaction_id` cannot be shared across keys. After three consecutive 429s the gateway migrates conversation context onto another key with a **new** sandbox. The default TPM strategy (`frok`) also migrates when recent usage hits `limit × ratio`. The optional `pace` strategy keeps the sticky key and waits until `recent usage + this round` is strictly below the TPM window; if the wait would exceed `tpmPaceMaxWaitMs` it still froks. Round size prefers the last success `total_tokens` on the conversation (including fork source/target keys) and otherwise estimates inline images as visual tokens (~1k–3k each, never Base64 `chars/4`). Downstream `conversation_mode` stays `continue`; the upstream hop is marked `frok` (key-rotation rebuild), not `new`. Tool history is sent as a non-executable summary (not `[Calls:]` templates) so the model cannot imitate fake tool traces.
 
 Standard OpenAI clients do not need extra session fields. If the client compresses, truncates, or replays old messages and the gateway cannot prove continuity, it **forks** onto a derived internal key and leaves the trunk `interaction_id` unchanged.
 
@@ -196,7 +196,7 @@ Standard OpenAI clients do not need extra session fields. If the client compress
 
 > **Note:** The model list above is hardcoded in `gateway/models.js` and `web/src/lib.js`. Google does not currently provide an API to query which `agent_config.model` values a managed agent supports — the standard `/v1beta/models` endpoint only returns standalone Gemini models, not agent-internal engine options. If Google adds or removes supported models in the future, these two files must be updated manually.
 
-Conversation state uses `previous_interaction_id`. When the request is a proven continuation, client-replayed `messages[]` are treated as a delta and only the new turn is sent upstream. Unverifiable compressed or truncated history forks instead of being hard-attached to the old chain. Images (`image_url` / `inline_data`) are forwarded. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
+Conversation state uses `previous_interaction_id`. When the request is a proven continuation, client-replayed `messages[]` are treated as a delta and only the new turn is sent upstream. Unverifiable compressed or truncated history forks instead of being hard-attached to the old chain. Images (`image_url` / `inline_data`) are forwarded; local TPM / migration estimates use image dimensions (or 2800 tokens when unknown), not Base64 length. OpenAI `tools` become custom functions the client must execute; remote MCP URLs can be passed as `extra_body.mcp_servers`. Local stdio MCP cannot run inside Google's sandbox.
 
 The gateway does **not** expose the Gemini model catalog on the API key. It only serves the Antigravity agent and the four `agent_config.model` backends that agent accepts:
 

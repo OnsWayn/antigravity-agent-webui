@@ -148,10 +148,262 @@ const CALL_MARKER_RE = /\[Calls:/i;
 const TOOL_RESULT_MARKER_RE = /Tool result\s*\(/i;
 const FAKE_SUCCESS_RE = /Message sent to session/i;
 
+const IMAGE_TILE_TOKENS = 258;
+const IMAGE_SMALL_MAX_SIDE = 384;
+const DEFAULT_MEDIA_RESOLUTION_TOKENS = 1120;
+const DEFAULT_IMAGE_TOKENS = 2800;
+const MAX_IMAGE_TOKENS = 8000;
+const IMAGE_HEADER_BYTES = 96 * 1024;
+
+function isDataUrlImage(value) {
+  return typeof value === 'string'
+    && /^data:image\//i.test(value)
+    && /;base64,/i.test(value);
+}
+
+function isHttpUrl(value) {
+  return typeof value === 'string' && /^https?:\/\//i.test(value);
+}
+
+function isImagePart(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const type = value.type;
+  if (type === 'image' || type === 'image_url' || type === 'input_image' || type === 'inline_data') return true;
+  if (value.inline_data || value.inlineData) return true;
+  if ((value.mime_type || value.mimeType) && (value.data || value.url)) return true;
+  return false;
+}
+
+function shouldSkipBase64Key(key, child) {
+  if (typeof child !== 'string') return false;
+  if (key === 'data') return child.length > 80 || isDataUrlImage(child);
+  if (key === 'url') return isDataUrlImage(child);
+  return false;
+}
+
+function decodeBase64Prefix(data, maxBytes = IMAGE_HEADER_BYTES) {
+  if (typeof data !== 'string' || !data) return null;
+  const raw = data.replace(/\s+/g, '');
+  if (!raw) return null;
+  const charsNeeded = Math.ceil(maxBytes * 4 / 3) + 8;
+  try {
+    const buf = Buffer.from(raw.slice(0, charsNeeded), 'base64');
+    return buf.length ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractImageBytes(part) {
+  if (part == null) return null;
+  if (typeof part === 'string') {
+    if (isHttpUrl(part)) return null;
+    if (isDataUrlImage(part) || part.startsWith('data:')) {
+      const comma = part.indexOf(',');
+      return comma >= 0 ? decodeBase64Prefix(part.slice(comma + 1)) : null;
+    }
+    return decodeBase64Prefix(part);
+  }
+  if (typeof part !== 'object') return null;
+  const nested = part.image_url && typeof part.image_url === 'object' ? part.image_url : null;
+  const url = typeof part.url === 'string'
+    ? part.url
+    : (typeof part.image_url === 'string' ? part.image_url : nested?.url);
+  if (typeof url === 'string') {
+    if (isHttpUrl(url)) return null;
+    if (isDataUrlImage(url) || url.startsWith('data:')) {
+      const comma = url.indexOf(',');
+      return comma >= 0 ? decodeBase64Prefix(url.slice(comma + 1)) : null;
+    }
+  }
+  const inline = part.inline_data || part.inlineData || nested || part;
+  const data = inline.data;
+  if (typeof data === 'string') {
+    if (isDataUrlImage(data) || data.startsWith('data:')) {
+      const comma = data.indexOf(',');
+      return comma >= 0 ? decodeBase64Prefix(data.slice(comma + 1)) : null;
+    }
+    return decodeBase64Prefix(data);
+  }
+  return null;
+}
+
+function readJpegDimensions(buf) {
+  if (!buf || buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return null;
+  let i = 2;
+  while (i + 8 < buf.length) {
+    if (buf[i] !== 0xFF) {
+      i += 1;
+      continue;
+    }
+    const marker = buf[i + 1];
+    if (marker === 0xD8) {
+      i += 2;
+      continue;
+    }
+    if (marker === 0xD9 || marker === 0xDA) break;
+    if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+      i += 2;
+      continue;
+    }
+    if (i + 3 >= buf.length) break;
+    const length = (buf[i + 2] << 8) | buf[i + 3];
+    if (length < 2) break;
+    const isSof = marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC;
+    if (isSof) {
+      const height = (buf[i + 5] << 8) | buf[i + 6];
+      const width = (buf[i + 7] << 8) | buf[i + 8];
+      if (width > 0 && height > 0) return { width, height };
+    }
+    i += 2 + length;
+  }
+  return null;
+}
+
+function readPngDimensions(buf) {
+  if (!buf || buf.length < 24) return null;
+  const sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+  for (let i = 0; i < 8; i++) {
+    if (buf[i] !== sig[i]) return null;
+  }
+  if (buf.toString('ascii', 12, 16) !== 'IHDR') return null;
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (width > 0 && height > 0) return { width, height };
+  return null;
+}
+
+function readGifDimensions(buf) {
+  if (!buf || buf.length < 10) return null;
+  const header = buf.toString('ascii', 0, 6);
+  if (header !== 'GIF87a' && header !== 'GIF89a') return null;
+  const width = buf.readUInt16LE(6);
+  const height = buf.readUInt16LE(8);
+  if (width > 0 && height > 0) return { width, height };
+  return null;
+}
+
+function readWebpDimensions(buf) {
+  if (!buf || buf.length < 16) return null;
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WEBP') return null;
+  const chunk = buf.toString('ascii', 12, 16);
+  if (chunk === 'VP8X' && buf.length >= 30) {
+    const width = 1 + buf[24] + (buf[25] << 8) + (buf[26] << 16);
+    const height = 1 + buf[27] + (buf[28] << 8) + (buf[29] << 16);
+    if (width > 0 && height > 0) return { width, height };
+  }
+  if (chunk === 'VP8 ' && buf.length >= 30) {
+    const start = 20;
+    if (buf[start + 3] === 0x9D && buf[start + 4] === 0x01 && buf[start + 5] === 0x2A) {
+      const width = buf.readUInt16LE(start + 6) & 0x3FFF;
+      const height = buf.readUInt16LE(start + 8) & 0x3FFF;
+      if (width > 0 && height > 0) return { width, height };
+    }
+  }
+  if (chunk === 'VP8L' && buf.length >= 25 && buf[20] === 0x2F) {
+    const bits = buf.readUInt32LE(21);
+    const width = (bits & 0x3FFF) + 1;
+    const height = ((bits >> 14) & 0x3FFF) + 1;
+    if (width > 0 && height > 0) return { width, height };
+  }
+  return null;
+}
+
+function readImageDimensions(part) {
+  const buf = extractImageBytes(part);
+  if (!buf) return null;
+  return readJpegDimensions(buf)
+    || readPngDimensions(buf)
+    || readGifDimensions(buf)
+    || readWebpDimensions(buf);
+}
+
+function geminiTileTokens(width, height) {
+  const w = Number(width);
+  const h = Number(height);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  if (w <= IMAGE_SMALL_MAX_SIDE && h <= IMAGE_SMALL_MAX_SIDE) return IMAGE_TILE_TOKENS;
+  const crop = Math.floor(Math.min(w, h) / 1.5);
+  if (!(crop > 0)) return IMAGE_TILE_TOKENS;
+  return Math.ceil(w / crop) * Math.ceil(h / crop) * IMAGE_TILE_TOKENS;
+}
+
+function imagePartHasHttpUrl(part) {
+  if (typeof part === 'string') return isHttpUrl(part);
+  if (!part || typeof part !== 'object') return false;
+  const url = typeof part.url === 'string'
+    ? part.url
+    : (typeof part.image_url === 'string' ? part.image_url : part.image_url?.url);
+  return isHttpUrl(url);
+}
+
+function clampImageTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_IMAGE_TOKENS;
+  return Math.min(MAX_IMAGE_TOKENS, Math.max(1, Math.ceil(n)));
+}
+
+function estimateImageTokens(part) {
+  if (imagePartHasHttpUrl(part) && !extractImageBytes(part)) {
+    return clampImageTokens(DEFAULT_IMAGE_TOKENS);
+  }
+  const dims = readImageDimensions(part);
+  if (dims) {
+    const tiled = geminiTileTokens(dims.width, dims.height);
+    if (tiled != null) {
+      return clampImageTokens(Math.max(tiled, DEFAULT_MEDIA_RESOLUTION_TOKENS));
+    }
+  }
+  return clampImageTokens(DEFAULT_IMAGE_TOKENS);
+}
+
+function addEstimate(value, stats) {
+  if (value == null) return;
+  if (typeof value === 'string') {
+    if (isDataUrlImage(value)) {
+      stats.imageTokens += estimateImageTokens({ url: value });
+      stats.imageCount += 1;
+      return;
+    }
+    stats.textTokens += Math.ceil(value.length / 4);
+    return;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    stats.textTokens += Math.ceil(String(value).length / 4);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const child of value) addEstimate(child, stats);
+    return;
+  }
+  if (typeof value === 'object') {
+    if (isImagePart(value)) {
+      stats.imageTokens += estimateImageTokens(value);
+      stats.imageCount += 1;
+      return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (shouldSkipBase64Key(key, child)) {
+        if (isDataUrlImage(child) || (key === 'data' && typeof child === 'string' && child.length > 80)) {
+          stats.imageTokens += estimateImageTokens(key === 'data' ? { data: child } : { url: child });
+          stats.imageCount += 1;
+        }
+        continue;
+      }
+      addEstimate(child, stats);
+    }
+  }
+}
+
+function estimateTokenBreakdown(value) {
+  const stats = { tokens: 0, textTokens: 0, imageTokens: 0, imageCount: 0 };
+  addEstimate(value, stats);
+  stats.tokens = stats.textTokens + stats.imageTokens;
+  return stats;
+}
+
 function estimateTokens(value) {
-  if (value == null) return 0;
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return Math.ceil(text.length / 4);
+  return estimateTokenBreakdown(value).tokens;
 }
 
 function truncateText(text, maxChars) {
@@ -271,14 +523,16 @@ function collapseInputParts(parts) {
   return list;
 }
 
-function collectSafeHistoryParts(messages) {
-  const parts = [];
+function collectSafeHistoryTurns(messages) {
+  const turns = [];
   for (const message of messages || []) {
     if (!message || message.role === 'system') continue;
     if (message.role === 'tool' || message.role === 'function') continue;
 
     const converted = openaiMessageToInputParts(message);
-    const label = message.role === 'assistant' ? 'Assistant' : 'User';
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const label = role === 'assistant' ? 'Assistant' : 'User';
+    const parts = [];
 
     if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
       const contentText = typeof converted === 'string'
@@ -286,12 +540,14 @@ function collectSafeHistoryParts(messages) {
         : (Array.isArray(converted) ? converted.filter((part) => part.type === 'text').map((part) => part.text || '').join('\n') : '');
       const visible = stripFakeToolTrace(contentText);
       if (visible) parts.push({ type: 'text', text: `${label}: ${visible}` });
+      if (parts.length) turns.push({ role, parts });
       continue;
     }
 
     if (typeof converted === 'string') {
       const text = message.role === 'assistant' ? stripFakeToolTrace(converted) : converted;
       if (text) parts.push({ type: 'text', text: `${label}: ${text}` });
+      if (parts.length) turns.push({ role, parts });
       continue;
     }
 
@@ -303,9 +559,52 @@ function collectSafeHistoryParts(messages) {
       if (text) parts.push({ type: 'text', text: `${label}: ${text}` });
       else if (imageParts.length) parts.push({ type: 'text', text: `${label}:` });
       parts.push(...imageParts);
+      if (parts.length) turns.push({ role, parts });
     }
   }
-  return parts;
+  return turns;
+}
+
+function collectSafeHistoryParts(messages) {
+  return collectSafeHistoryTurns(messages).flatMap((turn) => turn.parts);
+}
+
+function lastUserTurnIndex(turns) {
+  for (let i = (turns || []).length - 1; i >= 0; i--) {
+    if (turns[i]?.role === 'user') return i;
+  }
+  return -1;
+}
+
+function dedupeTurnImagesKeepLast(turns) {
+  const seen = new Set();
+  const next = [];
+  for (let i = (turns || []).length - 1; i >= 0; i--) {
+    const turn = turns[i];
+    const parts = [];
+    for (let j = (turn.parts || []).length - 1; j >= 0; j--) {
+      const part = turn.parts[j];
+      if (part?.type === 'image') {
+        const fp = imageFingerprint(part);
+        if (seen.has(fp)) continue;
+        seen.add(fp);
+      }
+      parts.unshift(part);
+    }
+    next.push({ ...turn, parts });
+  }
+  return next.reverse();
+}
+
+function historyMetaFromRebuild(rebuilt) {
+  if (!rebuilt) return {};
+  return {
+    historyTruncated: Boolean(rebuilt.truncated),
+    keptTurns: rebuilt.keptTurns,
+    droppedTurns: rebuilt.droppedTurns,
+    imageCount: rebuilt.imageCount,
+    estimatedInputTokens: rebuilt.estimatedTokens
+  };
 }
 
 function buildSafeHistoryInput(messages, {
@@ -316,27 +615,45 @@ function buildSafeHistoryInput(messages, {
 } = {}) {
   const summary = summarizeToolHistory(messages);
   const summaryBlock = formatToolSummaryBlock(summary);
-  const historyParts = collectSafeHistoryParts(messages);
+  const originalTurns = collectSafeHistoryTurns(messages);
+  const turns = dedupeTurnImagesKeepLast(originalTurns);
   const lead = [];
   if (preamble) lead.push({ type: 'text', text: preamble });
   if (summaryBlock) lead.push({ type: 'text', text: summaryBlock });
 
-  let kept = historyParts.slice();
+  let kept = turns.slice();
   const extras = Array.isArray(extraParts) ? extraParts.filter(Boolean) : [];
-  const assemble = (turns) => collapseInputParts([...lead, ...turns, ...extras]);
+  const assemble = (turnList) => collapseInputParts([
+    ...lead,
+    ...turnList.flatMap((turn) => turn.parts || []),
+    ...extras
+  ]);
   let input = assemble(kept);
   let truncated = false;
+  const protectLastUser = () => {
+    const idx = lastUserTurnIndex(kept);
+    return idx >= 0 ? idx : kept.length - 1;
+  };
   while (estimateTokens(input) > maxInputTokens && kept.length > 1) {
-    kept = kept.slice(1);
+    const protect = protectLastUser();
+    let dropAt = 0;
+    if (dropAt === protect) dropAt = 1;
+    if (dropAt >= kept.length) break;
+    kept = kept.filter((_, index) => index !== dropAt);
     input = assemble(kept);
     truncated = true;
   }
+  const breakdown = estimateTokenBreakdown(input);
   return {
     input,
     summary,
     truncated,
-    estimatedTokens: estimateTokens(input),
-    callMarkers: observeCallMarkers(messages)
+    estimatedTokens: breakdown.tokens,
+    callMarkers: observeCallMarkers(messages),
+    keptTurns: kept.length,
+    droppedTurns: Math.max(0, originalTurns.length - kept.length),
+    imageCount: breakdown.imageCount,
+    kind
   };
 }
 
@@ -525,7 +842,8 @@ function buildOpenAIConversation({
       mode: 'stateless',
       upstreamKeyId: stored?.upstream_key_id || null,
       toolTraceStatus: rebuilt.summary.toolTraceStatus,
-      callMarkers
+      callMarkers,
+      ...historyMetaFromRebuild(rebuilt)
     }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
@@ -554,7 +872,8 @@ function buildOpenAIConversation({
       mode: 'new',
       upstreamKeyId: null,
       toolTraceStatus: rebuilt?.summary.toolTraceStatus || 'none',
-      callMarkers
+      callMarkers,
+      ...historyMetaFromRebuild(rebuilt)
     }, { sourceConversationKey: lookupKey, targetConversationKey: lookupKey });
   }
 
@@ -591,7 +910,8 @@ function buildOpenAIConversation({
       mode: 'fork',
       upstreamKeyId: stored.upstream_key_id || null,
       toolTraceStatus: rebuilt.summary.toolTraceStatus,
-      callMarkers
+      callMarkers,
+      ...historyMetaFromRebuild(rebuilt)
     }, {
       sourceConversationKey: lookupKey,
       targetConversationKey,
@@ -1157,7 +1477,8 @@ function migrateConversationForKeyChange(conversation, source = {}, options = {}
     migrationTruncated: Boolean(rebuilt.truncated),
     migrationInputTokensEstimated: rebuilt.estimatedTokens,
     toolTraceStatus: rebuilt.summary?.toolTraceStatus || conversation.toolTraceStatus || 'none',
-    callMarkers: rebuilt.callMarkers || conversation.callMarkers
+    callMarkers: rebuilt.callMarkers || conversation.callMarkers,
+    ...historyMetaFromRebuild(rebuilt)
   }, {
     upstreamTransition: 'frok',
     sourceConversationKey: conversation.sourceConversationKey || conversation.conversationKey,
@@ -1295,6 +1616,10 @@ module.exports = {
   summarizeToolHistory,
   observeCallMarkers,
   estimateTokens,
+  estimateTokenBreakdown,
+  estimateImageTokens,
+  DEFAULT_IMAGE_TOKENS,
+  MAX_IMAGE_TOKENS,
   deriveForkConversationKey,
   resolveStoredConversation,
   buildSafeHistoryInput,

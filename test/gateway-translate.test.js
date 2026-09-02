@@ -2,13 +2,49 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   buildOpenAIConversation,
+  buildSafeHistoryInput,
+  estimateImageTokens,
+  estimateTokenBreakdown,
+  estimateTokens,
   hashNonAssistant,
   mergeTools,
   openaiMessageToInputParts,
   parseImageRef,
   pendingFunctionCalls,
-  toChatCompletion
+  toChatCompletion,
+  DEFAULT_IMAGE_TOKENS,
+  MAX_IMAGE_TOKENS
 } = require('../gateway/translate');
+
+function jpegDataUrl({ width = 1920, height = 1080, dataUrlLength } = {}) {
+  const prefix = 'data:image/jpeg;base64,';
+  const sof = Buffer.from([
+    0xFF, 0xD8,
+    0xFF, 0xC0, 0x00, 0x0B, 0x08,
+    (height >> 8) & 0xff, height & 0xff,
+    (width >> 8) & 0xff, width & 0xff,
+    0x01, 0x01, 0x11, 0x00,
+    0xFF, 0xD9
+  ]);
+  if (!dataUrlLength) return prefix + sof.toString('base64');
+  const b64Target = Math.max(0, dataUrlLength - prefix.length);
+  const rawTarget = Math.floor(b64Target * 3 / 4);
+  const pad = Math.max(0, rawTarget - sof.length);
+  const buf = Buffer.concat([
+    sof.subarray(0, sof.length - 2),
+    Buffer.alloc(pad, 0x00),
+    Buffer.from([0xFF, 0xD9])
+  ]);
+  let b64 = buf.toString('base64');
+  if (prefix.length + b64.length > dataUrlLength) b64 = b64.slice(0, dataUrlLength - prefix.length);
+  while (prefix.length + b64.length < dataUrlLength) b64 += 'A';
+  return prefix + b64;
+}
+
+function countInputImages(input) {
+  if (!Array.isArray(input)) return 0;
+  return input.filter((part) => part && part.type === 'image').length;
+}
 const { resolveModel: resolveGatewayModel } = require('../gateway/models');
 
 test('maps data URL images into Interactions image parts', () => {
@@ -349,4 +385,111 @@ test('orphan tool calls are recorded without invented results', () => {
   assert.equal(summary.orphans.length, 1);
   assert.equal(summary.orphans[0].callId, 'call_orphan');
   assert.equal(summary.toolTraceStatus, 'orphan');
+});
+
+test('estimateTokens uses visual image tokens instead of chars/4 for a 351763 data URL', () => {
+  const url = jpegDataUrl({ width: 1920, height: 1080, dataUrlLength: 351763 });
+  assert.equal(url.length, 351763);
+  const estimated = estimateTokens(url);
+  const naive = Math.ceil(url.length / 4);
+  assert.ok(estimated >= 258 && estimated <= MAX_IMAGE_TOKENS, `got ${estimated}`);
+  assert.notEqual(estimated, naive);
+  assert.ok(naive > 80000);
+  assert.equal(estimateImageTokens({ url }), estimated);
+});
+
+test('estimateTokens keeps chars/4 for plain strings', () => {
+  const text = 'abcd'.repeat(100);
+  assert.equal(estimateTokens(text), Math.ceil(text.length / 4));
+  assert.equal(estimateTokens('hello'), Math.ceil('hello'.length / 4));
+});
+
+test('tiny JPEG uses tile or media-resolution default, not chars/4', () => {
+  const url = jpegDataUrl({ width: 10, height: 10 });
+  const estimated = estimateTokens({ type: 'image', mime_type: 'image/jpeg', data: url.slice(url.indexOf(',') + 1) });
+  const naive = Math.ceil(url.length / 4);
+  assert.ok(estimated === 258 || estimated === 1120 || estimated === DEFAULT_IMAGE_TOKENS, `got ${estimated}`);
+  assert.notEqual(estimated, naive);
+  assert.ok(estimated <= MAX_IMAGE_TOKENS);
+});
+
+test('unparseable image data falls back to DEFAULT_IMAGE_TOKENS and stays capped', () => {
+  const estimated = estimateTokens({
+    type: 'image',
+    mime_type: 'image/jpeg',
+    data: 'this-is-not-a-valid-image-payload!!!!'
+  });
+  assert.equal(estimated, DEFAULT_IMAGE_TOKENS);
+  assert.ok(estimated <= MAX_IMAGE_TOKENS);
+});
+
+test('buildSafeHistoryInput keeps last-user text and both large images under 24000 budget', () => {
+  const big = jpegDataUrl({ width: 1920, height: 1080, dataUrlLength: 351763 });
+  const small = jpegDataUrl({ width: 640, height: 480, dataUrlLength: 57179 });
+  const rebuilt = buildSafeHistoryInput([
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'older context ' + 'x'.repeat(8000) },
+    { role: 'assistant', content: 'ack ' + 'y'.repeat(8000) },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '请根据表情包和参考人物继续画' },
+        { type: 'image_url', image_url: { url: big } },
+        { type: 'image_url', image_url: { url: small } }
+      ]
+    }
+  ], { maxInputTokens: 24000 });
+  const text = typeof rebuilt.input === 'string' ? rebuilt.input : JSON.stringify(rebuilt.input);
+  assert.match(text, /请根据表情包和参考人物继续画/);
+  assert.equal(countInputImages(rebuilt.input), 2);
+  assert.ok(rebuilt.estimatedTokens <= 24000 || rebuilt.imageCount === 2);
+  assert.ok(rebuilt.estimatedTokens < 50000);
+});
+
+test('buildSafeHistoryInput keeps only the last copy of a replayed image', () => {
+  const url = jpegDataUrl({ width: 800, height: 600, dataUrlLength: 120000 });
+  const imageTurn = {
+    role: 'user',
+    content: [
+      { type: 'text', text: 'see this' },
+      { type: 'image_url', image_url: { url } }
+    ]
+  };
+  const rebuilt = buildSafeHistoryInput([
+    imageTurn,
+    { role: 'assistant', content: 'ok' },
+    { ...imageTurn, content: [...imageTurn.content] },
+    { role: 'assistant', content: 'still ok' },
+    { ...imageTurn, content: [...imageTurn.content] }
+  ], { maxInputTokens: 24000 });
+  assert.equal(countInputImages(rebuilt.input), 1);
+  const text = JSON.stringify(rebuilt.input);
+  assert.match(text, /see this/);
+});
+
+test('over-budget plain text still drops oldest turns and keeps the last user', () => {
+  const messages = [];
+  for (let i = 0; i < 10; i++) {
+    messages.push({ role: 'user', content: `user-${i} ${'x'.repeat(6000)}` });
+    if (i < 9) messages.push({ role: 'assistant', content: `asst-${i} ${'y'.repeat(6000)}` });
+  }
+  const rebuilt = buildSafeHistoryInput(messages, { maxInputTokens: 24000 });
+  assert.equal(rebuilt.truncated, true);
+  const text = typeof rebuilt.input === 'string' ? rebuilt.input : JSON.stringify(rebuilt.input);
+  assert.match(text, /user-9/);
+  assert.doesNotMatch(text, /user-0 /);
+  assert.ok(rebuilt.keptTurns >= 1);
+  assert.ok(rebuilt.droppedTurns >= 1);
+});
+
+test('estimateTokenBreakdown reports image count without inflating text tokens', () => {
+  const url = jpegDataUrl({ width: 1920, height: 1080, dataUrlLength: 80000 });
+  const breakdown = estimateTokenBreakdown([
+    { type: 'text', text: 'hello image' },
+    { type: 'image', mime_type: 'image/jpeg', data: url.slice(url.indexOf(',') + 1) }
+  ]);
+  assert.equal(breakdown.imageCount, 1);
+  assert.ok(breakdown.imageTokens >= 258 && breakdown.imageTokens <= MAX_IMAGE_TOKENS);
+  assert.ok(breakdown.textTokens < 100);
+  assert.equal(breakdown.tokens, breakdown.textTokens + breakdown.imageTokens);
 });

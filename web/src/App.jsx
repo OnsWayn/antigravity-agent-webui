@@ -543,7 +543,7 @@ export default function App() {
 
             {tab === 'docs' && (
               <section className="box markdown">
-                <h3>Antigravity Studio v1.7.3</h3>
+                <h3>Antigravity Studio v1.7.4</h3>
                 <p>本系统以 <b>协议中转站 (Protocol Gateway)</b> 与 <b>独立日志控制台 (Log Dashboard)</b> 为核心，同时集成 Google Interactions 远程沙盒调试能力。</p>
                 <h4>对外模型规范</h4>
                 <p>下游客户端 (Cursor / Cline / QQ 机器人 / OpenAI SDK / LangChain 等) 请求时：</p>

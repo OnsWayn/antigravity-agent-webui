@@ -56,7 +56,7 @@ function withApp(callUpstream, callback) {
   const app = express();
   const requestCounter = new RequestCounter();
   app.use(createOriginGuard({ port: 3999 }));
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '8mb' }));
   app.use(createGatewayRouter({
     database,
     masterKey,
@@ -540,6 +540,40 @@ function seedGatewayClient(database, masterKey, { keys = ['gemini-test-key'] } =
   };
 }
 
+function jpegDataUrl({ width = 1920, height = 1080, dataUrlLength } = {}) {
+  const prefix = 'data:image/jpeg;base64,';
+  const sof = Buffer.from([
+    0xFF, 0xD8,
+    0xFF, 0xC0, 0x00, 0x0B, 0x08,
+    (height >> 8) & 0xff, height & 0xff,
+    (width >> 8) & 0xff, width & 0xff,
+    0x01, 0x01, 0x11, 0x00,
+    0xFF, 0xD9
+  ]);
+  if (!dataUrlLength) return prefix + sof.toString('base64');
+  const b64Target = Math.max(0, dataUrlLength - prefix.length);
+  const rawTarget = Math.floor(b64Target * 3 / 4);
+  const pad = Math.max(0, rawTarget - sof.length);
+  const buf = Buffer.concat([
+    sof.subarray(0, sof.length - 2),
+    Buffer.alloc(pad, 0x00),
+    Buffer.from([0xFF, 0xD9])
+  ]);
+  let b64 = buf.toString('base64');
+  if (prefix.length + b64.length > dataUrlLength) b64 = b64.slice(0, dataUrlLength - prefix.length);
+  while (prefix.length + b64.length < dataUrlLength) b64 += 'A';
+  return prefix + b64;
+}
+
+function parseDiagnostics(row) {
+  try {
+    const parsed = JSON.parse(row?.diagnostics_json || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 test('successful callUpstream increments rpmUsed and rpdUsed on GET /keys', async () => {
   let calls = 0;
   await withApp(async () => {
@@ -731,5 +765,127 @@ test('pace froks immediately when estimated wait exceeds maxWait', async () => {
     assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: second })).status, 200);
     assert.ok(Date.now() - started < 2000);
     assert.equal(payloads[1].previous_interaction_id, undefined);
+  });
+});
+
+test('pace new request with a large inline image does not frok_oversize', async () => {
+  const payloads = [];
+  await withApp(async ({ payload }) => {
+    payloads.push(payload);
+    return {
+      id: `int-img-${payloads.length}`,
+      status: 'completed',
+      environment_id: 'env-img',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_input_tokens: 9000, total_output_tokens: 200, total_tokens: 9200 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'img-new-session';
+    const patched = await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: {
+        tpmStrategy: 'pace',
+        tpmPaceLimit: 100000,
+        tpmWindowMs: 60000,
+        tpmPaceMaxWaitMs: 20000,
+        tpmPaceDelayMs: 0
+      }
+    });
+    assert.equal(patched.status, 200);
+    const url = jpegDataUrl({ width: 1920, height: 1080, dataUrlLength: 420000 });
+    assert.ok(Math.ceil(url.length / 4) > 100000);
+    const res = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: {
+        model: 'gemini-3.7-flash',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+            { type: 'image_url', image_url: { url } }
+          ]
+        }]
+      }
+    });
+    assert.equal(res.status, 200);
+    assert.equal(payloads[0].previous_interaction_id, undefined);
+    const { logs } = database.listGatewayRequestLogs({ limit: 5 });
+    const diag = parseDiagnostics(logs[0]);
+    assert.notEqual(diag.tpmPacingDecision, 'frok_oversize');
+    assert.notEqual(logs[0].upstream_transition, 'frok');
+    assert.ok(diag.neededTokens < 20000, `neededTokens=${diag.neededTokens}`);
+    assert.ok(diag.estimatedImageCount >= 1);
+    assert.equal(diag.neededSource, 'estimate');
+  });
+});
+
+test('fork then continue uses logged usage for neededSource and does not frok_oversize', async () => {
+  const payloads = [];
+  await withApp(async ({ payload }) => {
+    payloads.push(payload);
+    return {
+      id: `int-forkimg-${payloads.length}`,
+      status: 'completed',
+      environment_id: `env-forkimg-${payloads.length}`,
+      output_text: 'ok',
+      steps: [],
+      usage: { total_input_tokens: 8800, total_output_tokens: 300, total_tokens: 9100 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    headers['x-session-id'] = 'img-fork-session';
+    await request(base, '/api/gateway/settings', {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${adminToken}` },
+      body: { tpmStrategy: 'pace', tpmPaceLimit: 100000, tpmPaceDelayMs: 0 }
+    });
+    const url = jpegDataUrl({ width: 1920, height: 1080, dataUrlLength: 351763 });
+    const imageContent = (text) => [
+      { type: 'text', text },
+      { type: 'image_url', image_url: { url } }
+    ];
+    assert.equal((await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: imageContent('hello') }] }
+    })).status, 200);
+
+    const forked = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: imageContent('CHANGED') },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: imageContent('next') }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: forked })).status, 200);
+    assert.equal(payloads[1].previous_interaction_id, undefined);
+    const forkImages = Array.isArray(payloads[1].input)
+      ? payloads[1].input.filter((part) => part && part.type === 'image').length
+      : 0;
+    assert.equal(forkImages, 1);
+
+    const continued = {
+      model: 'gemini-3.7-flash',
+      messages: [
+        { role: 'user', content: imageContent('CHANGED') },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: imageContent('next') },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: imageContent('again') }
+      ]
+    };
+    assert.equal((await request(base, '/v1/chat/completions', { method: 'POST', headers, body: continued })).status, 200);
+
+    const { logs } = database.listGatewayRequestLogs({ limit: 10 });
+    const continueLog = logs.find((row) => row.conversation_mode === 'continue') || logs[0];
+    const diag = parseDiagnostics(continueLog);
+    assert.match(String(diag.neededSource || ''), /^log:/);
+    assert.ok(diag.neededTokens < 100000, `neededTokens=${diag.neededTokens}`);
+    assert.notEqual(diag.tpmPacingDecision, 'frok_oversize');
   });
 });

@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.7.3** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.7.4** · Node.js **22.5+** · License **Apache-2.0**
 
 > **免费档使用建议。** Gemini / Antigravity 免费层级大约只有 **100,000 TPM**，适合当作轻量聊天 API，不适合高并发或重度 Agent 循环。建议在下游 Token 上关闭沙盒三项内置工具（代码执行、谷歌搜索、网页抓取），把工具执行交给调用方自己的 Agent 框架。
 >
@@ -183,7 +183,7 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 网关始终调用 Interactions：`agent: "antigravity-preview-05-2026"`，`environment: "remote"`（或复用已有环境 ID）。不会走 `generateContent`（对该 agent 会 400）。允许的 `agent_config.model`：`gemini-3.7-flash`、`gemini-3.6-flash`、`gemini-3.5-flash`、`gemini-3.5-flash-lite`。
 
-可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 时，会把当前对话带到下一把 Key 上开**新沙盒**继续。默认 TPM 策略（`frok`）在用量达到 `上限 × 比例` 时同样迁移。可选 `pace` 策略会钉住原 Key，等到 `已用量 + 本轮` 严格小于 TPM 窗口再发；预计等待超过 `tpmPaceMaxWaitMs` 仍 frok。下游 `conversation_mode` 仍为 `continue`，上游记为 `frok`（Key 轮换重建），不是 `new`。工具历史以不可执行摘要迁移，不再生成 `[Calls:]` 模板，避免模型模仿假工具调用（旧沙盒里的文件带不过去）。
+可配置多把上游 Gemini Key。新会话按最近最少使用轮询；同一会话会粘在原来的 Key 上，因为 `environment_id` / `previous_interaction_id` 不能跨 Key 复用。某把 Key 连续 3 次 429 时，会把当前对话带到下一把 Key 上开**新沙盒**继续。默认 TPM 策略（`frok`）在用量达到 `上限 × 比例` 时同样迁移。可选 `pace` 策略会钉住原 Key，等到 `已用量 + 本轮` 严格小于 TPM 窗口再发；预计等待超过 `tpmPaceMaxWaitMs` 仍 frok。本轮大小优先用该会话最近一次成功 `total_tokens`（含 fork 主干/分支 key），否则按视觉 token 估算 inline 图片（大约 1k–3k / 张，不再把 Base64 当 `chars/4`）。下游 `conversation_mode` 仍为 `continue`，上游记为 `frok`（Key 轮换重建），不是 `new`。工具历史以不可执行摘要迁移，不再生成 `[Calls:]` 模板，避免模型模仿假工具调用（旧沙盒里的文件带不过去）。
 
 标准 OpenAI 客户端不必传私有会话字段。若客户端压缩、截断或重放旧消息，且网关无法证明与主干连续，会 **fork** 到内部派生 key，主干 `interaction_id` 保持不变。
 
@@ -195,7 +195,7 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 > **注意**：上述模型列表是在代码中硬编码的（`gateway/models.js` 和 `web/src/lib.js`）。Google 目前没有提供 API 来查询某个 managed agent 支持哪些 `agent_config.model` 值——标准的 `/v1beta/models` 接口只返回独立 Gemini 模型目录，不包含 Agent 内部引擎信息。如果 Google 将来新增或下线模型，需要手动更新这两个文件。
 
-多轮对话使用服务端 `previous_interaction_id`。能证明连续时，回传的 `messages[]` 只用来计算本轮增量，不会整段再发一遍；无法验证的压缩或截断历史会 fork，而不是硬接旧链。支持图片。OpenAI `tools` 会变成自定义函数并由客户端执行；远程 MCP URL 可通过 `extra_body.mcp_servers` 传递。本机 stdio MCP 无法在 Google 沙盒里运行。
+多轮对话使用服务端 `previous_interaction_id`。能证明连续时，回传的 `messages[]` 只用来计算本轮增量，不会整段再发一遍；无法验证的压缩或截断历史会 fork，而不是硬接旧链。支持图片；TPM / 迁移预算按图片尺寸估算（解析不了时按 2800 token），不用 Base64 长度。OpenAI `tools` 会变成自定义函数并由客户端执行；远程 MCP URL 可通过 `extra_body.mcp_servers` 传递。本机 stdio MCP 无法在 Google 沙盒里运行。
 
 网关**不会**列出该 API Key 名下的普通 Gemini 模型目录。它只提供 Antigravity Agent，以及这个 Agent 允许的 4 个 `agent_config.model`：
 

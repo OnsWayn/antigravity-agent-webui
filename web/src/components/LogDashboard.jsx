@@ -1,6 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
 import { copyText, formatDate, formatDuration, formatTokens, safeJson } from '../lib';
 
+function diagnosticsOf(log) {
+  const raw = log?.diagnostics_json;
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 export default function LogDashboard({ adminToken, clientTokens = [] }) {
   const [logs, setLogs] = useState([]);
   const [total, setTotal] = useState(0);
@@ -177,6 +189,7 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
           const isSuccess = log.status === 'success';
           const isRateLimited = log.status === 'rate_limited';
           const isError = log.status === 'error';
+          const diag = diagnosticsOf(log);
 
           let statusBadge = <span className="badge ok">✅ 成功</span>;
           if (isRateLimited) statusBadge = <span className="badge warn">⚠️ 429 限流</span>;
@@ -238,6 +251,17 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                   )}
                   {Number(log.raw_call_marker_count) > 0 && (
                     <span className="badge warn" style={{ marginLeft: 4 }}>[Calls:] × {log.raw_call_marker_count}</span>
+                  )}
+                  {diag.tpmPacingDecision && (
+                    <span className="tag" style={{ marginLeft: 4 }}>pace: {diag.tpmPacingDecision}</span>
+                  )}
+                  {diag.neededSource && (
+                    <span className="tag" style={{ marginLeft: 4 }}>
+                      needed: {formatTokens(diag.neededTokens)} ({diag.neededSource})
+                    </span>
+                  )}
+                  {Number(diag.estimatedImageCount) > 0 && (
+                    <span className="tag" style={{ marginLeft: 4 }}>images: {diag.estimatedImageCount}</span>
                   )}
                 </div>
 
