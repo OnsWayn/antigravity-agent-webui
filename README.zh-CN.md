@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.7.6** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.7.7** · Node.js **22.5+** · License **Apache-2.0**
 
 > **免费档使用建议。** Gemini / Antigravity 免费层级大约只有 **100,000 TPM**，适合当作轻量聊天 API，不适合高并发或重度 Agent 循环。建议在下游 Token 上关闭沙盒三项内置工具（代码执行、谷歌搜索、网页抓取），把工具执行交给调用方自己的 Agent 框架。
 >

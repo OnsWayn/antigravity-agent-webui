@@ -6,7 +6,7 @@ A high-performance **OpenAI / Gemini protocol gateway** and **management dashboa
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.7.6** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.7.7** · Node.js **22.5+** · License **Apache-2.0**
 
 > **Free-tier note.** Gemini / Antigravity free quota is about **100,000 TPM**. Use it as a lightweight chat API, not a high-throughput agent loop. On downstream tokens, turn off the three sandbox tools (code execution, Google Search, URL context) and let the caller's agent framework run tools instead.
 >

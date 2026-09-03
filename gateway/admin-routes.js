@@ -5,6 +5,7 @@ const { sendJson } = require('./errors');
 const { listGatewayModels } = require('./models');
 const { publicUpstreamKey } = require('./routes');
 const { resolveGatewaySettings, clampGatewaySettings, envGatewaySettings } = require('./settings');
+const { resolveRpdLimit } = require('./upstream');
 
 function tryDecrypt(ciphertext, iv, tag, masterKey) {
   if (!masterKey || !ciphertext || !iv || !tag) return null;
@@ -62,14 +63,11 @@ function createAdminRouter(options = {}) {
     database,
     masterKey,
     adminToken,
-    enabled = process.env.GATEWAY_ENABLED !== 'false',
-    requestCounter
+    enabled = process.env.GATEWAY_ENABLED !== 'false'
   } = options;
 
   function mapUpstreamKey(row) {
-    const pub = publicUpstreamKey(row, { requestCounter });
-    pub.apiKey = tryDecrypt(row.key_ciphertext, row.key_iv, row.key_tag, masterKey);
-    return pub;
+    return publicUpstreamKey(row);
   }
 
   function mapToken(row) {
@@ -124,7 +122,8 @@ function createAdminRouter(options = {}) {
       iv: encrypted.iv,
       tag: encrypted.tag,
       suffix: keySuffix(apiKey),
-      proxyUrl: req.body?.proxyUrl || null
+      proxyUrl: req.body?.proxyUrl || null,
+      rpdLimit: req.body?.rpdLimit
     });
     sendJson(res, 201, { success: true, key: mapUpstreamKey(row) });
   });
@@ -138,6 +137,9 @@ function createAdminRouter(options = {}) {
       proxyUrl: req.body?.proxyUrl,
       enabled: req.body?.enabled
     };
+    if (req.body?.rpdLimit !== undefined) {
+      fields.rpdLimit = resolveRpdLimit(req.body.rpdLimit);
+    }
     if (req.body?.apiKey) {
       const encrypted = encryptSecret(String(req.body.apiKey).trim(), masterKey);
       fields.ciphertext = encrypted.ciphertext;

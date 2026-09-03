@@ -5,7 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { AppDatabase } = require('../database');
 const { encryptSecret, keySuffix } = require('../gateway/crypto');
-const { isRateLimitError, isInternalError, pickUpstreamKey, TpmTracker, RequestCounter } = require('../gateway/upstream');
+const { isRateLimitError, isDailyQuotaError, isInternalError, isUpstreamKeyDailyExhausted, pickUpstreamKey, TpmTracker, RequestCounter } = require('../gateway/upstream');
 
 function withDatabase(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-up-'));
@@ -33,6 +33,16 @@ test('detects 429 and resource exhausted as rate limits', () => {
   assert.equal(isRateLimitError({ status: 429, message: 'slow down' }), true);
   assert.equal(isRateLimitError({ status: 400, code: 'RESOURCE_EXHAUSTED' }), true);
   assert.equal(isRateLimitError({ status: 500, message: 'boom' }), false);
+});
+
+test('detects Google free-tier daily request quota without treating every 429 as daily', () => {
+  assert.equal(isDailyQuotaError({
+    status: 429,
+    code: 'too_many_requests',
+    message: 'Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 100, model: antigravity'
+  }), true);
+  assert.equal(isDailyQuotaError({ status: 429, message: 'RESOURCE_EXHAUSTED' }), false);
+  assert.equal(isDailyQuotaError({ status: 429, message: 'Please retry in 20s' }), false);
 });
 
 test('detects Internal error encountered and does not treat it as a rate limit', () => {
@@ -176,6 +186,35 @@ test('commitReservation replaces the hold with actual usage', () => {
   const id = tracker.tryReserve('k', 40000, { now: 0 });
   tracker.commitReservation(id, 42000, 10);
   assert.equal(tracker.getRecentUsage('k', 10), 42000);
+});
+
+test('pickUpstreamKey skips a key that already hit its daily request cap', () => {
+  withDatabase((database) => {
+    const master = 'm';
+    const a = insertKey(database, master, 'secret-a', 'A');
+    const b = insertKey(database, master, 'secret-b', 'B');
+    const ts = Date.parse('2026-08-28T06:30:00Z');
+    for (let i = 0; i < 100; i += 1) database.incrementUpstreamKeyRequest(a.id, ts);
+    const picked = pickUpstreamKey(database, master, { preferId: a.id, now: ts });
+    assert.equal(picked.row.id, b.id);
+  });
+});
+
+test('daily quota exhausted key is skipped until the next Pacific day', () => {
+  withDatabase((database) => {
+    const master = 'm';
+    const a = insertKey(database, master, 'secret-a', 'A');
+    insertKey(database, master, 'secret-b', 'B');
+    const sameDay = Date.parse('2026-08-28T06:30:00Z');
+    const nextDay = Date.parse('2026-08-28T07:00:00Z');
+    database.markUpstreamKeyDailyQuotaExhausted(a.id, sameDay);
+    assert.equal(isUpstreamKeyDailyExhausted(database.getUpstreamKey(a.id), sameDay), true);
+    const picked = pickUpstreamKey(database, master, { preferId: a.id, now: sameDay });
+    assert.notEqual(picked.row.id, a.id);
+    assert.equal(isUpstreamKeyDailyExhausted(database.getUpstreamKey(a.id), nextDay), false);
+    const after = pickUpstreamKey(database, master, { preferId: a.id, now: nextDay });
+    assert.equal(after.row.id, a.id);
+  });
 });
 
 test('RequestCounter drops timestamps outside the sliding window', () => {

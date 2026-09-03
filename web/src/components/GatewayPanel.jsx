@@ -17,6 +17,7 @@ export default function GatewayPanel({
   const [keyName, setKeyName] = useState('');
   const [keyValue, setKeyValue] = useState('');
   const [keyProxy, setKeyProxy] = useState('');
+  const [keyRpdLimit, setKeyRpdLimit] = useState('100');
 
   // Token creation form
   const [tokenName, setTokenName] = useState('Cursor Client');
@@ -123,11 +124,17 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
     try {
       await gatewayFetch('/api/gateway/keys', {
         method: 'POST',
-        body: JSON.stringify({ name: keyName || 'Gemini Key', apiKey: keyValue.trim(), proxyUrl: keyProxy.trim() || undefined })
+        body: JSON.stringify({
+          name: keyName || 'Gemini Key',
+          apiKey: keyValue.trim(),
+          proxyUrl: keyProxy.trim() || undefined,
+          rpdLimit: Number(keyRpdLimit) > 0 ? Number(keyRpdLimit) : 100
+        })
       });
       setKeyName('');
       setKeyValue('');
       setKeyProxy('');
+      setKeyRpdLimit('100');
       loadGateway();
     } catch (err) {
       setGatewayError(err.message);
@@ -205,11 +212,12 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
       {/* 2. Upstream Keys Management */}
       <section className="box">
         <div className="box-head">🔑 上游 Gemini API Key 池</div>
-        <p className="hint">配置的 Key 将以 AES-256-GCM 加密保存在服务端，支持负载均衡、TPM 感知避让与 429 故障自动平滑迁移沙盒。</p>
+        <p className="hint">配置的 Key 以 AES-256-GCM 加密保存在服务端，界面只显示后缀、不可复制。支持负载均衡、TPM 感知避让、日请求上限与 429 故障自动平滑迁移沙盒。</p>
         <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
           <input className="input grow" value={keyName} onChange={(e) => setKeyName(e.target.value)} placeholder="Key 名称 (如 主Key-1)" style={{ minWidth: 120 }} />
           <input className="input mono grow" value={keyValue} onChange={(e) => setKeyValue(e.target.value)} placeholder="真实 Gemini Key (AIzaSy...)" style={{ minWidth: 200 }} />
           <input className="input mono grow" value={keyProxy} onChange={(e) => setKeyProxy(e.target.value)} placeholder="可选独立代理 (如 http://127.0.0.1:7890)" style={{ minWidth: 160 }} />
+          <input className="input" type="number" min="1" value={keyRpdLimit} onChange={(e) => setKeyRpdLimit(e.target.value)} placeholder="日请求上限" title="日请求上限，默认 100" style={{ width: 110 }} />
           <button className="btn btn-primary" onClick={handleAddKey}>+ 添加 Key</button>
         </div>
 
@@ -220,18 +228,41 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
               <div>
                 <b style={{ fontSize: 14 }}>{item.name}</b>
                 <div className="key-copy-row">
-                  <code className="key-plain">{item.apiKey || ('…' + item.suffix)}</code>
-                  {item.apiKey && (
-                    <button className="btn btn-sm" onClick={() => copyValue(item.apiKey, 'key-' + item.id)}>
-                      {copiedId === 'key-' + item.id ? '已复制' : '复制'}
-                    </button>
-                  )}
+                  <code className="key-masked">…{item.suffix || '****'}</code>
                 </div>
                 <div className="hint">
-                  {item.proxyUrl ? ('代理: ' + item.proxyUrl + ' · ') : ''}{item.enabled ? '🟢 已启用' : '⚪ 已停用'}
+                  {item.proxyUrl ? ('代理: ' + item.proxyUrl + ' · ') : ''}
+                  {item.rpdExhausted ? '🔴 今日额度已用尽' : (item.enabled ? '🟢 已启用' : '⚪ 已停用')}
                 </div>
                 <div className="hint" title="与 Google AI Studio RPD 日切一致，不用北京 0 点。对齐 AI Studio 日切，不是谷歌项目总额。">
-                  本分钟 {item.rpmUsed ?? 0} · 今日 {item.rpdUsed ?? 0} · 下次刷新 {item.rpdResetAt ? formatDate(item.rpdResetAt).slice(0, 16) : '-'}（太平洋时间午夜，随冬夏令时）
+                  今日 {item.rpdUsed ?? 0} / {item.rpdLimit ?? 100}
+                  {item.rpdExhausted
+                    ? ' · 停用至下次刷新 ' + (item.rpdResetAt ? formatDate(item.rpdResetAt).slice(0, 16) : '-') + '（太平洋时间午夜）'
+                    : ' · 下次刷新 ' + (item.rpdResetAt ? formatDate(item.rpdResetAt).slice(0, 16) : '-') + '（太平洋时间午夜，随冬夏令时）'}
+                </div>
+                <div className="row" style={{ gap: 8, marginTop: 6, alignItems: 'center' }}>
+                  <label className="hint" style={{ margin: 0 }}>日上限</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min="1"
+                    style={{ width: 88 }}
+                    defaultValue={item.rpdLimit ?? 100}
+                    key={'rpd-' + item.id + '-' + (item.rpdLimit ?? 100)}
+                    onBlur={async (e) => {
+                      const n = Number(e.target.value);
+                      if (!Number.isFinite(n) || n < 1 || n === item.rpdLimit) return;
+                      try {
+                        await gatewayFetch('/api/gateway/keys/' + item.id, {
+                          method: 'PATCH',
+                          body: JSON.stringify({ rpdLimit: n })
+                        });
+                        loadGateway();
+                      } catch (err) {
+                        setGatewayError(err.message);
+                      }
+                    }}
+                  />
                 </div>
               </div>
               <span>

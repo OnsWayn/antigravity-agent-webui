@@ -10,7 +10,7 @@ const { encryptSecret, generateClientToken, keySuffix } = require('../gateway/cr
 const { createGatewayRouter } = require('../gateway/routes');
 const { createAdminRouter } = require('../gateway/admin-routes');
 const { createOriginGuard } = require('../http-security');
-const { RequestCounter } = require('../gateway/upstream');
+
 
 function listen(app) {
   return new Promise((resolve) => {
@@ -54,22 +54,19 @@ function withApp(callUpstream, callback) {
   const masterKey = 'unit-master-key';
   const adminToken = 'unit-admin';
   const app = express();
-  const requestCounter = new RequestCounter();
   app.use(createOriginGuard({ port: 3999 }));
   app.use(express.json({ limit: '8mb' }));
   app.use(createGatewayRouter({
     database,
     masterKey,
     enabled: true,
-    callUpstream,
-    requestCounter
+    callUpstream
   }));
   app.use('/api/gateway', createAdminRouter({
     database,
     masterKey,
     adminToken,
-    enabled: true,
-    requestCounter
+    enabled: true
   }));
   return listen(app).then(async (ctx) => {
     try {
@@ -508,7 +505,9 @@ test('admin can list full upstream keys and persisted client tokens', async () =
       headers: { Authorization: `Bearer ${adminToken}` }
     });
     assert.equal(keysRes.status, 200);
-    assert.equal(keysRes.json.keys[0].apiKey, 'AIzaSyVisibleKey999');
+    assert.equal(keysRes.json.keys[0].apiKey, undefined);
+    assert.equal(keysRes.json.keys[0].suffix, keySuffix('AIzaSyVisibleKey999'));
+    assert.equal(keysRes.json.keys[0].rpdLimit, 100);
 
     const created = await request(base, '/api/gateway/tokens', {
       method: 'POST',
@@ -677,7 +676,7 @@ function parseDiagnostics(row) {
   }
 }
 
-test('successful callUpstream increments rpmUsed and rpdUsed on GET /keys', async () => {
+test('successful callUpstream increments rpdUsed on GET /keys', async () => {
   let calls = 0;
   await withApp(async () => {
     calls += 1;
@@ -707,8 +706,9 @@ test('successful callUpstream increments rpmUsed and rpdUsed on GET /keys', asyn
     });
     assert.equal(keysRes.status, 200);
     const key = keysRes.json.keys[0];
-    assert.ok(key.rpmUsed >= 2);
+    assert.equal(key.rpmUsed, undefined);
     assert.ok(key.rpdUsed >= 2);
+    assert.equal(key.rpdLimit, 100);
     assert.equal(typeof key.rpdResetAt, 'number');
     assert.match(String(key.rpdDay), /^\d{4}-\d{2}-\d{2}$/);
   });
@@ -1241,5 +1241,118 @@ test('abort during a hung upstream call marks the log client_disconnected', asyn
     assert.ok(logs.length >= 1);
     assert.notEqual(logs[0].status, 'pending');
     assert.equal(logs[0].error_code, 'client_disconnected');
+  });
+});
+
+test('retry success clears leftover rate-limit error from the request log', async () => {
+  let calls = 0;
+  await withApp(async () => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error('RESOURCE_EXHAUSTED');
+      error.status = 429;
+      error.code = 'too_many_requests';
+      throw error;
+    }
+    return {
+      id: 'int-retry-ok',
+      status: 'completed',
+      environment_id: 'env-retry',
+      output_text: 'ok',
+      steps: [],
+      usage: { total_tokens: 5 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const { headers } = seedGatewayClient(database, masterKey);
+    const res = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'retry-clear' }] }
+    });
+    assert.equal(res.status, 200);
+    const logsRes = await request(base, '/api/gateway/logs', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const row = (logsRes.json.logs || []).find((item) => item.endpoint === '/v1/chat/completions');
+    assert.ok(row);
+    assert.equal(row.status, 'success');
+    assert.equal(row.error_message, null);
+    assert.equal(row.error_code, null);
+    assert.equal(row.upstream_key_name, 'key-0');
+    assert.equal(row.upstream_response_status, 200);
+  });
+});
+
+test('daily quota limit: 100 exhausts the key immediately, switches, and logs the serving key', async () => {
+  const calls = [];
+  await withApp(async ({ apiKey }) => {
+    calls.push(apiKey);
+    if (apiKey === 'key-a') {
+      const error = new Error('You exceeded your current quota, please check your plan and billing details.\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 100, model: antigravity\nPlease retry in 57s.');
+      error.status = 429;
+      error.code = 'too_many_requests';
+      throw error;
+    }
+    return {
+      id: 'int-b',
+      status: 'completed',
+      environment_id: 'env-b',
+      output_text: 'recovered',
+      steps: [],
+      usage: { total_tokens: 4 }
+    };
+  }, async ({ base, database, masterKey, adminToken }) => {
+    const keyA = encryptSecret('key-a', masterKey);
+    const keyB = encryptSecret('key-b', masterKey);
+    database.insertUpstreamKey({
+      name: 'Gemini API Key',
+      ciphertext: keyA.ciphertext,
+      iv: keyA.iv,
+      tag: keyA.tag,
+      suffix: 'keya'
+    });
+    database.insertUpstreamKey({
+      name: 'qq',
+      ciphertext: keyB.ciphertext,
+      iv: keyB.iv,
+      tag: keyB.tag,
+      suffix: 'keyb'
+    });
+    const generated = generateClientToken();
+    database.insertClientToken({
+      name: 'client',
+      tokenHash: generated.tokenHash,
+      tokenPrefix: generated.tokenPrefix,
+      quotaTokens: -1
+    });
+    const headers = { Authorization: `Bearer ${generated.token}` };
+    const res = await request(base, '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'quota-switch' }] }
+    });
+    assert.equal(res.status, 200);
+    assert.equal(calls.filter((item) => item === 'key-a').length, 1);
+    assert.equal(calls.some((item) => item === 'key-b'), true);
+
+    const keysRes = await request(base, '/api/gateway/keys', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const exhausted = keysRes.json.keys.find((item) => item.name === 'Gemini API Key');
+    const serving = keysRes.json.keys.find((item) => item.name === 'qq');
+    assert.equal(exhausted.rpdExhausted, true);
+    assert.equal(serving.rpdExhausted, false);
+
+    const logsRes = await request(base, '/api/gateway/logs', {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const row = (logsRes.json.logs || []).find((item) => item.endpoint === '/v1/chat/completions');
+    assert.ok(row);
+    assert.equal(row.status, 'success');
+    assert.equal(row.upstream_key_name, 'qq');
+    assert.equal(row.error_message, null);
+    assert.equal(row.error_code, null);
+    const diag = parseDiagnostics(row);
+    assert.equal(diag.dailyQuotaExhaustedKeyName, 'Gemini API Key');
   });
 });

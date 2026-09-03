@@ -16,8 +16,6 @@ try {
   if (error.code !== 'ENOENT') throw error;
 }
 
-const { RequestCounter } = require('./gateway/upstream');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -52,20 +50,17 @@ app.use(express.json({ limit: '50mb' }));
 const GATEWAY_MASTER_KEY = process.env.GATEWAY_MASTER_KEY || '';
 const GATEWAY_ADMIN_TOKEN = process.env.GATEWAY_ADMIN_TOKEN || '';
 const GATEWAY_ENABLED = process.env.GATEWAY_ENABLED !== 'false';
-const requestCounter = new RequestCounter();
 app.use(createGatewayRouter({
   database,
   masterKey: GATEWAY_MASTER_KEY,
   enabled: GATEWAY_ENABLED,
-  log: logMessage,
-  requestCounter
+  log: logMessage
 }));
 app.use('/api/gateway', createAdminRouter({
   database,
   masterKey: GATEWAY_MASTER_KEY,
   adminToken: GATEWAY_ADMIN_TOKEN,
-  enabled: GATEWAY_ENABLED,
-  requestCounter
+  enabled: GATEWAY_ENABLED
 }));
 app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,

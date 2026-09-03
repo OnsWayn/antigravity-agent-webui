@@ -193,7 +193,6 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
 
         {logs.map((log) => {
           const isExpanded = expandedCards.has(log.request_id);
-          const isSuccess = log.status === 'success';
           const isRateLimited = log.status === 'rate_limited';
           const isError = log.status === 'error';
           const diag = diagnosticsOf(log);
@@ -234,6 +233,11 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                   {log.key_switch_count > 0 && (
                     <span className="badge warn" style={{ marginLeft: 6 }}>
                       🔄 切换 {log.key_switch_count} 次 (重试 {log.retry_count} 次)
+                    </span>
+                  )}
+                  {diag.dailyQuotaExhaustedKeyName && (
+                    <span className="badge warn" style={{ marginLeft: 6 }}>
+                      日请求耗尽: {diag.dailyQuotaExhaustedKeyName}
                     </span>
                   )}
                 </div>
@@ -286,7 +290,7 @@ export default function LogDashboard({ adminToken, clientTokens = [] }) {
                 )}
               </div>
 
-              {(log.error_message || isError || isRateLimited) && (
+              {(isError || isRateLimited) && (
                 <div className="log-error-box">
                   <div className="error-title">
                     ⚠️ 错误码: <b>{log.error_code || (isRateLimited ? 'RESOURCE_EXHAUSTED' : 'UNKNOWN')}</b> (HTTP {log.upstream_response_status || 500})

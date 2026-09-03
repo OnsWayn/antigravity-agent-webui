@@ -1,9 +1,11 @@
 const crypto = require('crypto');
 const { decryptSecret } = require('./crypto');
 const { resolveEnvProxyUrl } = require('./interactions');
+const { pacificDayKey } = require('./pacific-time');
 
 const RATE_LIMIT_TRIES_PER_KEY = 3;
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
+const DEFAULT_RPD_LIMIT = 100;
 
 function isRateLimitError(error) {
   const status = Number(error?.status);
@@ -14,6 +16,39 @@ function isRateLimitError(error) {
     || text.includes('rate limit')
     || text.includes('too many requests')
     || text.includes('quota');
+}
+
+function errorText(error) {
+  const parts = [error?.code, error?.message];
+  if (error?.rawError) {
+    try { parts.push(JSON.stringify(error.rawError)); } catch {}
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+function isDailyQuotaError(error) {
+  const text = errorText(error);
+  if (/limit:\s*100\b/i.test(text)) return true;
+  if (/generate_content_free_tier_requests/i.test(text)) return true;
+  return false;
+}
+
+function resolveRpdLimit(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_RPD_LIMIT;
+  return Math.min(Math.floor(n), 1_000_000);
+}
+
+function upstreamKeyRpdUsed(row, now = Date.now()) {
+  const today = pacificDayKey(now);
+  return row?.rpd_pacific_day === today ? Number(row.rpd_count || 0) : 0;
+}
+
+function isUpstreamKeyDailyExhausted(row, now = Date.now()) {
+  if (!row) return false;
+  const today = pacificDayKey(now);
+  if (row.rpd_exhausted_day === today) return true;
+  return upstreamKeyRpdUsed(row, now) >= resolveRpdLimit(row.rpd_limit);
 }
 
 function isInternalError(error) {
@@ -258,8 +293,16 @@ function pickUpstreamKey(database, masterKey, {
     throw error;
   }
 
+  const dailyOk = rows.filter((row) => !isUpstreamKeyDailyExhausted(row, now));
+  if (!dailyOk.length) {
+    const error = new Error('All upstream Gemini API keys have exhausted their daily request quota');
+    error.status = 429;
+    error.code = 'all_keys_daily_quota';
+    throw error;
+  }
+
   const excluded = new Set(excludeIds);
-  const available = rows.filter((row) => !excluded.has(row.id));
+  const available = dailyOk.filter((row) => !excluded.has(row.id));
   if (!available.length) {
     const error = new Error('All upstream Gemini API keys are cooling down after rate limits');
     error.status = 429;
@@ -323,11 +366,16 @@ function pickUpstreamKey(database, masterKey, {
 module.exports = {
   RATE_LIMIT_TRIES_PER_KEY,
   RATE_LIMIT_COOLDOWN_MS,
+  DEFAULT_RPD_LIMIT,
   isRateLimitError,
+  isDailyQuotaError,
   isInternalError,
   rewriteInternalError,
   pickUpstreamKey,
   decryptKeyRow,
   TpmTracker,
-  RequestCounter
+  RequestCounter,
+  resolveRpdLimit,
+  upstreamKeyRpdUsed,
+  isUpstreamKeyDailyExhausted
 };

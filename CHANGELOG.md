@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.7.7] - 2026-09-03
+
+### Added
+
+- Per-key daily request cap (`rpdLimit`, default 100). Keys that reach the cap, or that receive Google `limit: 100` / `generate_content_free_tier_requests` quota errors, leave the pool until Pacific midnight.
+
+### Changed
+
+- Admin APIs no longer return decrypted upstream Gemini keys. The WebUI shows only the suffix and does not offer copy.
+- Upstream key rows no longer show this-minute RPM; daily RPD remains, with an editable cap.
+
+### Fixed
+
+- Request logs no longer keep a previous attempt's `too_many_requests` / `limit: 100` error after a retry or key switch succeeds. The recorded key is the one that actually served the request.
+
 ## [1.7.6] - 2026-09-02
 
 ### Added

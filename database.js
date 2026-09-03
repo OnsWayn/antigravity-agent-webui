@@ -2,7 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
-const { pacificDayKey } = require('./gateway/pacific-time');
+const { pacificDayKey, nextPacificMidnightMs } = require('./gateway/pacific-time');
+
+const DEFAULT_RPD_LIMIT = 100;
+
+function resolveRpdLimit(value, fallback = DEFAULT_RPD_LIMIT) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), 1_000_000);
+}
 
 function parseJson(value, fallback) {
   if (!value) return fallback;
@@ -252,6 +260,7 @@ class AppDatabase {
       this.createSchemaV6();
       this.createSchemaV7();
       this.createSchemaV8();
+      this.createSchemaV9();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
@@ -259,6 +268,7 @@ class AppDatabase {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(Date.now());
       return;
     }
 
@@ -291,6 +301,10 @@ class AppDatabase {
     this.createSchemaV8();
     if (version < 8) {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(Date.now());
+    }
+    this.createSchemaV9();
+    if (version < 9) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(Date.now());
     }
   }
 
@@ -410,6 +424,12 @@ class AppDatabase {
     this.ensureColumn('client_tokens', 'token_ciphertext', 'TEXT');
     this.ensureColumn('client_tokens', 'token_iv', 'TEXT');
     this.ensureColumn('client_tokens', 'token_tag', 'TEXT');
+  }
+
+  createSchemaV9() {
+    if (!this.tableExists('upstream_keys')) return;
+    this.ensureColumn('upstream_keys', 'rpd_limit', `INTEGER NOT NULL DEFAULT ${DEFAULT_RPD_LIMIT}`);
+    this.ensureColumn('upstream_keys', 'rpd_exhausted_day', 'TEXT');
   }
 
   createSchemaV4() {
@@ -775,15 +795,26 @@ class AppDatabase {
     };
   }
 
-  insertUpstreamKey({ id, name, ciphertext, iv, tag, suffix, proxyUrl }) {
+  insertUpstreamKey({ id, name, ciphertext, iv, tag, suffix, proxyUrl, rpdLimit }) {
     const now = Date.now();
     const keyId = id || `uk-${crypto.randomUUID()}`;
     this.db.prepare(`
       INSERT INTO upstream_keys (
         id, name, key_ciphertext, key_iv, key_tag, key_suffix, proxy_url,
-        enabled, fail_count, last_used_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?, ?)
-    `).run(keyId, name || 'Gemini Key', ciphertext, iv, tag, suffix || '', proxyUrl || null, now, now);
+        enabled, fail_count, last_used_at, created_at, updated_at, rpd_limit
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?, ?, ?)
+    `).run(
+      keyId,
+      name || 'Gemini Key',
+      ciphertext,
+      iv,
+      tag,
+      suffix || '',
+      proxyUrl || null,
+      now,
+      now,
+      resolveRpdLimit(rpdLimit)
+    );
     return this.getUpstreamKey(keyId);
   }
 
@@ -812,6 +843,7 @@ class AppDatabase {
         key_suffix = ?,
         proxy_url = ?,
         enabled = ?,
+        rpd_limit = ?,
         updated_at = ?
       WHERE id = ?
     `).run(
@@ -822,6 +854,7 @@ class AppDatabase {
       fields.suffix !== undefined ? fields.suffix : existing.key_suffix,
       fields.proxyUrl !== undefined ? fields.proxyUrl : existing.proxy_url,
       fields.enabled !== undefined ? (fields.enabled ? 1 : 0) : existing.enabled,
+      fields.rpdLimit !== undefined ? resolveRpdLimit(fields.rpdLimit, existing.rpd_limit || DEFAULT_RPD_LIMIT) : resolveRpdLimit(existing.rpd_limit),
       now,
       id
     );
@@ -839,13 +872,34 @@ class AppDatabase {
     const now = Number(ts);
     if (existing.rpd_pacific_day !== day) {
       this.db.prepare(`
-        UPDATE upstream_keys SET rpd_pacific_day = ?, rpd_count = 1, updated_at = ? WHERE id = ?
+        UPDATE upstream_keys SET rpd_pacific_day = ?, rpd_count = 1, rpd_exhausted_day = NULL, updated_at = ? WHERE id = ?
       `).run(day, now, id);
     } else {
       this.db.prepare(`
         UPDATE upstream_keys SET rpd_count = rpd_count + 1, updated_at = ? WHERE id = ?
       `).run(now, id);
     }
+    return this.getUpstreamKey(id);
+  }
+
+  markUpstreamKeyDailyQuotaExhausted(id, ts = Date.now()) {
+    const existing = this.getUpstreamKey(id);
+    if (!existing) return null;
+    const day = pacificDayKey(ts);
+    const now = Number(ts);
+    const limit = resolveRpdLimit(existing.rpd_limit);
+    const current = existing.rpd_pacific_day === day ? Number(existing.rpd_count || 0) : 0;
+    const count = Math.max(current, limit);
+    const until = nextPacificMidnightMs(now);
+    this.db.prepare(`
+      UPDATE upstream_keys SET
+        rpd_pacific_day = ?,
+        rpd_count = ?,
+        rpd_exhausted_day = ?,
+        cooldown_until = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(day, count, day, until, now, id);
     return this.getUpstreamKey(id);
   }
 

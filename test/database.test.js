@@ -472,3 +472,38 @@ test('incrementUpstreamKeyRequest accumulates within a Pacific day and resets ac
     assert.equal(afterRollover.rpd_count, 1);
   });
 });
+
+test('upstream keys default to rpd_limit 100 and daily quota exhausts until Pacific midnight', () => {
+  withDatabase((database) => {
+    const key = database.insertUpstreamKey({
+      name: 'cap',
+      ciphertext: 'cipher',
+      iv: 'iv',
+      tag: 'tag',
+      suffix: 'cap1'
+    });
+    assert.equal(key.rpd_limit, 100);
+    const sameDay = Date.parse('2026-08-28T06:30:00Z');
+    const nextDay = Date.parse('2026-08-28T07:00:00Z');
+    const exhausted = database.markUpstreamKeyDailyQuotaExhausted(key.id, sameDay);
+    assert.equal(exhausted.rpd_exhausted_day, '2026-08-27');
+    assert.equal(exhausted.rpd_pacific_day, '2026-08-27');
+    assert.equal(exhausted.rpd_count, 100);
+    assert.ok(Number(exhausted.cooldown_until) > sameDay);
+    const rolled = database.incrementUpstreamKeyRequest(key.id, nextDay);
+    assert.equal(rolled.rpd_pacific_day, '2026-08-28');
+    assert.equal(rolled.rpd_count, 1);
+    assert.equal(rolled.rpd_exhausted_day, null);
+    const custom = database.insertUpstreamKey({
+      name: 'custom',
+      ciphertext: 'c',
+      iv: 'i',
+      tag: 't',
+      suffix: 'cus1',
+      rpdLimit: 50
+    });
+    assert.equal(custom.rpd_limit, 50);
+    const updated = database.updateUpstreamKey(custom.id, { rpdLimit: 200 });
+    assert.equal(updated.rpd_limit, 200);
+  });
+});

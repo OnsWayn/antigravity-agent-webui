@@ -3,7 +3,7 @@ const { authenticateClient } = require('./auth');
 const { openaiError, geminiError, sendJson } = require('./errors');
 const { callInteractions } = require('./interactions');
 const { AGENT_ID, listGatewayModels, resolveModel } = require('./models');
-const { isRateLimitError, isInternalError, rewriteInternalError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker, RequestCounter } = require('./upstream');
+const { isRateLimitError, isDailyQuotaError, isInternalError, rewriteInternalError, pickUpstreamKey, RATE_LIMIT_TRIES_PER_KEY, RATE_LIMIT_COOLDOWN_MS, TpmTracker, resolveRpdLimit, isUpstreamKeyDailyExhausted } = require('./upstream');
 const {
   applyStreamEvent,
   emitChatCompletionsFinish,
@@ -76,9 +76,7 @@ function publicUpstreamKey(row, extras = {}) {
   const now = extras.now != null ? Number(extras.now) : Date.now();
   const today = pacificDayKey(now);
   const rpdUsed = row.rpd_pacific_day === today ? Number(row.rpd_count || 0) : 0;
-  const rpmUsed = extras.requestCounter && typeof extras.requestCounter.getRpm === 'function'
-    ? extras.requestCounter.getRpm(row.id, now)
-    : Number(row.rpmUsed || 0);
+  const rpdLimit = resolveRpdLimit(row.rpd_limit);
   return {
     id: row.id,
     name: row.name,
@@ -89,8 +87,9 @@ function publicUpstreamKey(row, extras = {}) {
     cooldownUntil: row.cooldown_until || null,
     lastUsedAt: row.last_used_at,
     createdAt: row.created_at,
-    rpmUsed,
     rpdUsed,
+    rpdLimit,
+    rpdExhausted: isUpstreamKeyDailyExhausted(row, now),
     rpdResetAt: nextPacificMidnightMs(now),
     rpdDay: today
   };
@@ -434,12 +433,10 @@ function createGatewayRouter(options = {}) {
     tpmLimit,
     tpmThresholdRatio,
     tpmWindowMs,
-    migrationMaxInputTokens,
-    requestCounter: injectedRequestCounter
+    migrationMaxInputTokens
   } = options;
 
   const logger = createGatewayLogger(log);
-  const requestCounter = injectedRequestCounter || new RequestCounter();
   const tpmTracker = new TpmTracker({
     onReserveExpired: (info) => logger.logEvent('warn', 'tpm_reserve_expired', info)
   });
@@ -470,12 +467,10 @@ function createGatewayRouter(options = {}) {
       windowMs: settings.tpmWindowMs,
       reserveTtlMs: settings.tpmReserveTtlMs
     });
-    requestCounter.configure({ windowMs: settings.tpmWindowMs });
     return settings;
   }
 
   function noteUpstreamAttempt(keyId) {
-    requestCounter.recordRequest(keyId);
     if (database && typeof database.incrementUpstreamKeyRequest === 'function') {
       database.incrementUpstreamKeyRequest(keyId);
     }
@@ -966,6 +961,7 @@ function createGatewayRouter(options = {}) {
     }
 
     try {
+      let switchReason = 'rate_limit';
       for (let switchIndex = 0; switchIndex < keyBudget; switchIndex++) {
         let upstream;
         let reserveId = null;
@@ -1061,7 +1057,7 @@ function createGatewayRouter(options = {}) {
             forceMigrate: switchIndex > 0,
             requestId,
             rebuildReason: switchIndex > 0
-              ? 'rate_limit'
+              ? switchReason
               : (tpmAvoided ? 'tpm_limit' : 'key_rotation'),
             maxInputTokens: settings.migrationMaxInputTokens
           }
@@ -1176,6 +1172,8 @@ function createGatewayRouter(options = {}) {
               database.markUpstreamKeyUsed(upstream.row.id);
               try {
                 database.updateGatewayRequestLog(requestId, {
+                  upstreamKeyId: upstream.row.id,
+                  upstreamKeyName: upstream.row.name,
                   upstreamResponseJson: sanitizeForStorage(data),
                   upstreamResponseStatus: 200,
                   responseInteractionId: data.id || null,
@@ -1184,7 +1182,9 @@ function createGatewayRouter(options = {}) {
                   completionTokens: usage.completionTokens,
                   totalTokens: usage.totalTokens,
                   durationMs: Date.now() - startedAt,
-                  status: 'success'
+                  status: 'success',
+                  errorMessage: null,
+                  errorCode: null
                 });
                 markLogSettled();
               } catch {}
@@ -1265,6 +1265,8 @@ function createGatewayRouter(options = {}) {
             database.markUpstreamKeyUsed(upstream.row.id);
             try {
               database.updateGatewayRequestLog(requestId, {
+                upstreamKeyId: upstream.row.id,
+                upstreamKeyName: upstream.row.name,
                 upstreamResponseJson: sanitizeForStorage(data),
                 upstreamResponseStatus: 200,
                 responseInteractionId: data.id || null,
@@ -1273,7 +1275,9 @@ function createGatewayRouter(options = {}) {
                 completionTokens: usage.completionTokens,
                 totalTokens: usage.totalTokens,
                 durationMs: Date.now() - startedAt,
-                status: 'success'
+                status: 'success',
+                errorMessage: null,
+                errorCode: null
               });
               markLogSettled();
             } catch {}
@@ -1321,6 +1325,45 @@ function createGatewayRouter(options = {}) {
               onClientGone();
               try { res.destroy(); } catch {}
               return;
+            }
+            if (isDailyQuotaError(error)) {
+              if (reserveId) {
+                tpmTracker.cancelReservation(reserveId);
+                reserveId = null;
+              }
+              if (database && typeof database.markUpstreamKeyDailyQuotaExhausted === 'function') {
+                database.markUpstreamKeyDailyQuotaExhausted(upstream.row.id);
+              } else {
+                database.markUpstreamKeyUsed(upstream.row.id, {
+                  rateLimited: true,
+                  cooldownMs: RATE_LIMIT_COOLDOWN_MS
+                });
+              }
+              try {
+                database.updateGatewayRequestLog(requestId, {
+                  upstreamKeyId: upstream.row.id,
+                  upstreamKeyName: upstream.row.name,
+                  status: 'rate_limited',
+                  errorMessage: error.message,
+                  errorCode: error.code || 'daily_quota',
+                  upstreamResponseStatus: error.status || 429,
+                  upstreamResponseJson: sanitizeForStorage(error.rawError || { error: { message: error.message, code: error.code, status: error.status } }),
+                  durationMs: Date.now() - startedAt
+                });
+                mergeRequestDiagnostics(database, requestId, {
+                  dailyQuotaExhaustedKeyId: upstream.row.id,
+                  dailyQuotaExhaustedKeyName: upstream.row.name
+                });
+              } catch {}
+              logger.logEvent('warn', 'key_daily_quota', {
+                requestId,
+                upstreamKey: upstream.row.id,
+                upstreamKeyName: upstream.row.name,
+                message: error.message
+              });
+              switchReason = 'daily_quota';
+              excludeIds.push(upstream.row.id);
+              break;
             }
             if (isInternalError(error)) {
               const fail = rewriteInternalError(error);

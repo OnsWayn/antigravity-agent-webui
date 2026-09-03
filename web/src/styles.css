@@ -701,6 +701,17 @@ a { color: var(--cyan); }
   border-radius: 6px;
   padding: 4px 8px;
 }
+.key-masked {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  user-select: none;
+  -webkit-user-select: none;
+}
 
 .status-ok { color: var(--green); font-size: 13px; }
 .status-bad { color: var(--amber); font-size: 13px; }
