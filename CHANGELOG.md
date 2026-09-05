@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.8.0] - 2026-09-05
+
+### Added
+
+- WebUI App Shell with sidebar feature pages: dashboard, sandbox, artifacts, gateway, keys, tokens, logs, settings, and docs. Hash routes (`#/sandbox`, `#/keys`, …) keep each capability on its own page.
+- Sandbox file attachments. Uploaded files are injected into `/workspace` as `environment.sources` on a new sandbox; reusing an environment prepends a write instruction so the agent materializes the files first.
+- Web sandbox key picker. The page selects an upstream key from the pool; the server decrypts it with the admin token and calls Gemini Interactions directly.
+- Sandbox model list: **自动** and **gemini-3.8-flash**. Gemini 3.5 Flash / Flash-Lite are no longer offered on the submit form.
+
+### Changed
+
+- Web sandbox tasks no longer use a separate browser-local Gemini key modal.
+- Web submissions skip protocol-gateway clone / fork / 100k TPM rotation. Those rules still apply only to `/v1` downstream traffic.
+- Sandbox sessions store the upstream key id used to create them, so continuing a chat can stick to the same key.
+
 ## [1.7.7] - 2026-09-03
 
 ### Added

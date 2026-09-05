@@ -261,6 +261,7 @@ class AppDatabase {
       this.createSchemaV7();
       this.createSchemaV8();
       this.createSchemaV9();
+      this.createSchemaV10();
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(Date.now());
@@ -269,6 +270,7 @@ class AppDatabase {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)').run(Date.now());
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(Date.now());
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, ?)').run(Date.now());
       return;
     }
 
@@ -305,6 +307,10 @@ class AppDatabase {
     this.createSchemaV9();
     if (version < 9) {
       this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, ?)').run(Date.now());
+    }
+    this.createSchemaV10();
+    if (version < 10) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, ?)').run(Date.now());
     }
   }
 
@@ -432,6 +438,11 @@ class AppDatabase {
     this.ensureColumn('upstream_keys', 'rpd_exhausted_day', 'TEXT');
   }
 
+  createSchemaV10() {
+    if (!this.tableExists('sessions')) return;
+    this.ensureColumn('sessions', 'upstream_key_id', 'TEXT');
+  }
+
   createSchemaV4() {
     if (!this.tableExists('upstream_keys') || !this.tableExists('gateway_conversations')) return;
     this.ensureColumn('upstream_keys', 'cooldown_until', 'INTEGER');
@@ -533,8 +544,9 @@ class AppDatabase {
     this.upsertSessionStmt = this.db.prepare(`
       INSERT INTO sessions (
         id, environment_id, name, created_at, updated_at,
-        last_interaction_id, last_prompt, last_output, last_steps_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_interaction_id, last_prompt, last_output, last_steps_json,
+        upstream_key_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         environment_id = excluded.environment_id,
         name = excluded.name,
@@ -542,7 +554,8 @@ class AppDatabase {
         last_interaction_id = CASE WHEN excluded.last_interaction_id IS NOT NULL AND excluded.updated_at >= sessions.updated_at THEN excluded.last_interaction_id ELSE sessions.last_interaction_id END,
         last_prompt = CASE WHEN excluded.last_interaction_id IS NOT NULL AND excluded.updated_at >= sessions.updated_at THEN excluded.last_prompt ELSE sessions.last_prompt END,
         last_output = CASE WHEN excluded.last_interaction_id IS NOT NULL AND excluded.updated_at >= sessions.updated_at THEN excluded.last_output ELSE sessions.last_output END,
-        last_steps_json = CASE WHEN excluded.last_interaction_id IS NOT NULL AND excluded.updated_at >= sessions.updated_at THEN excluded.last_steps_json ELSE sessions.last_steps_json END
+        last_steps_json = CASE WHEN excluded.last_interaction_id IS NOT NULL AND excluded.updated_at >= sessions.updated_at THEN excluded.last_steps_json ELSE sessions.last_steps_json END,
+        upstream_key_id = COALESCE(excluded.upstream_key_id, sessions.upstream_key_id)
     `);
 
     this.upsertInteractionStmt = this.db.prepare(`
@@ -608,12 +621,13 @@ class AppDatabase {
       details.lastInteractionId || null,
       details.lastPrompt ?? null,
       details.lastOutput ?? null,
-      json(details.steps)
+      json(details.steps),
+      details.upstreamKeyId || existing?.upstream_key_id || null
     );
     return id;
   }
 
-  saveInteraction({ environmentId, sessionId, previousInteractionId, interactionId, prompt, outputText, steps, status, model, usage, request, timestamp, sessionName }) {
+  saveInteraction({ environmentId, sessionId, previousInteractionId, interactionId, prompt, outputText, steps, status, model, usage, request, timestamp, sessionName, upstreamKeyId }) {
     if (!environmentId) return null;
     const createdAt = Number(timestamp || Date.now());
     const id = interactionId || `local-${crypto.randomUUID()}`;
@@ -628,7 +642,8 @@ class AppDatabase {
         lastInteractionId: id,
         lastPrompt: prompt || '',
         lastOutput: outputText || '',
-        steps
+        steps,
+        upstreamKeyId
       });
 
       this.upsertInteractionStmt.run(
@@ -729,6 +744,7 @@ class AppDatabase {
         steps: parseJson(session.last_steps_json, []),
         createdAt: Number(session.created_at),
         updatedAt: Number(session.updated_at),
+        upstreamKeyId: session.upstream_key_id || null,
         turns
       };
     });

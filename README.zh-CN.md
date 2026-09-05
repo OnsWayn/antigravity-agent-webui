@@ -6,7 +6,7 @@
 
 > 非官方社区项目。Antigravity managed agents 和 Gemini Interactions API 均为预览功能，接口可能随时变化。
 
-当前版本：**1.7.7** · Node.js **22.5+** · License **Apache-2.0**
+当前版本：**1.8.0** · Node.js **22.5+** · License **Apache-2.0**
 
 > **免费档使用建议。** Gemini / Antigravity 免费层级大约只有 **100,000 TPM**，适合当作轻量聊天 API，不适合高并发或重度 Agent 循环。建议在下游 Token 上关闭沙盒三项内置工具（代码执行、谷歌搜索、网页抓取），把工具执行交给调用方自己的 Agent 框架。
 >
@@ -69,7 +69,7 @@ npm install
 npm start
 ```
 
-浏览器访问 <http://localhost:3000>，点击右上角“配置 API Key”。
+浏览器访问 <http://localhost:3000>。WebUI 是左侧边栏 + 功能分页的管理后台（App Shell）：仪表盘、沙盒任务、文件提取、上游 Key、下游 Token、请求日志、运行设置各自一页。先在「上游 Key」添加 Gemini Key，在「运行设置」填入 `GATEWAY_ADMIN_TOKEN`，再在「沙盒任务」里选择要用的 Key。网页提交直连 Gemini Interactions，**不走**协议网关的 clone / fork / 100k TPM 限额。提交任务时可以上传文件，新建沙盒会写入 `/workspace`。
 
 WebUI 使用 React。本地热更新开发：
 
@@ -77,7 +77,7 @@ WebUI 使用 React。本地热更新开发：
 npm run dev
 ```
 
-会同时启动 3000 端口的 API 和 5173 端口的 Vite。生产静态文件由 `npm run build` 输出到 `public/`。API Key 只保存在当前浏览器的 `localStorage`，不会写入 SQLite。
+会同时启动 3000 端口的 API 和 5173 端口的 Vite。生产静态文件由 `npm run build` 输出到 `public/`。浏览器只保存管理 Token 和所选 Key 的 id；真正的 Gemini Key 仍加密存放在服务端。
 
 如果服务之前已经运行，修改代码后需要重启 Node.js 服务，再对页面执行一次强制刷新。
 
@@ -202,10 +202,9 @@ curl.exe http://localhost:3000/api/interactions/create `
 
 网关**不会**列出该 API Key 名下的普通 Gemini 模型目录。`GET /v1/models` 返回你添加的名字（默认如下）。客户端应直接填这些名字，不要带 `antigravity-preview-05-2026/` 前缀：
 
+- `gemini-3.8-flash`
 - `gemini-3.7-flash`（请求未带 `model` 时的默认值）
 - `gemini-3.6-flash`
-- `gemini-3.5-flash`
-- `gemini-3.5-flash-lite`
 
 带前缀的旧写法如 `antigravity-preview-05-2026/gemini-3.7-flash` 仍然可用，发给上游前会去掉前缀。
 

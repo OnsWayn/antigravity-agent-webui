@@ -2,13 +2,106 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 
 export const AGENT_ID = 'antigravity-preview-05-2026';
-export const APP_VERSION = '1.7.7';
+export const APP_VERSION = '1.8.0';
+
+export const NAV_PAGES = [
+  {
+    group: '工作台',
+    items: [
+      { id: 'dashboard', label: '仪表盘', hint: '状态总览' },
+      { id: 'sandbox', label: '沙盒任务', hint: '提交 Agent 任务' },
+      { id: 'artifacts', label: '文件提取', hint: '下载沙盒产物' }
+    ]
+  },
+  {
+    group: '协议网关',
+    items: [
+      { id: 'gateway', label: '协议概览', hint: '调用方式与状态' },
+      { id: 'keys', label: '上游 Key', hint: 'Gemini Key 池' },
+      { id: 'tokens', label: '下游 Token', hint: '客户端凭证' },
+      { id: 'logs', label: '请求日志', hint: '全链路审计' }
+    ]
+  },
+  {
+    group: '系统',
+    items: [
+      { id: 'settings', label: '运行设置', hint: 'TPM / 模型 / 代理' },
+      { id: 'docs', label: '说明文档', hint: '能力与约定' }
+    ]
+  }
+];
+
+export const PAGE_IDS = NAV_PAGES.flatMap((group) => group.items.map((item) => item.id));
+
+export function pageFromHash() {
+  const raw = String(window.location.hash || '').replace(/^#\/?/, '').split('?')[0];
+  return PAGE_IDS.includes(raw) ? raw : 'dashboard';
+}
+
+export function pageHash(id) {
+  return `#/${id}`;
+}
+
+const TEXT_FILE_RE = /\.(txt|md|markdown|json|js|jsx|ts|tsx|mjs|cjs|css|html|htm|xml|yml|yaml|csv|tsv|py|rb|go|rs|java|kt|c|h|cpp|hpp|cc|sh|bash|zsh|sql|toml|ini|env|log|svg|gitignore|dockerfile|makefile)$/i;
+
+export function isTextFile(file) {
+  if (!file) return false;
+  if (file.type && (file.type.startsWith('text/') || file.type === 'application/json' || file.type === 'application/xml' || file.type.endsWith('+json') || file.type.endsWith('+xml'))) {
+    return true;
+  }
+  return TEXT_FILE_RE.test(file.name || '');
+}
+
+export function formatBytes(num) {
+  const n = Number(num);
+  if (!Number.isFinite(n) || n < 0) return '-';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function readFileAsSource(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) {
+      reject(new Error('没有选择文件'));
+      return;
+    }
+    const reader = new FileReader();
+    const asText = isTextFile(file);
+    reader.onload = () => {
+      const target = `/workspace/${file.name}`;
+      if (asText) {
+        resolve({
+          target,
+          name: file.name,
+          size: file.size,
+          mime: file.type || 'text/plain',
+          encoding: 'utf8',
+          content: String(reader.result || '')
+        });
+        return;
+      }
+      const dataUrl = String(reader.result || '');
+      resolve({
+        target,
+        name: file.name,
+        size: file.size,
+        mime: file.type || 'application/octet-stream',
+        encoding: 'base64',
+        content: dataUrl.split(',')[1] || ''
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+    if (asText) reader.readAsText(file);
+    else reader.readAsDataURL(file);
+  });
+}
 
 export const BACKEND_MODELS = [
-  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', hint: '默认 · 推理 / 编码 / 工具' },
-  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', hint: '上一代 Flash' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', hint: '轻量工作流' },
-  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite', hint: '低成本 / 低延迟' }
+  { id: 'auto', label: '自动', hint: '由 Agent 自行选择模型' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', hint: '新一代 Flash' },
+  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', hint: '推理 / 编码 / 工具' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', hint: '上一代 Flash' }
 ];
 
 export const PRESETS = {

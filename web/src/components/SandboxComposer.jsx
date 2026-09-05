@@ -1,66 +1,67 @@
 import { useState } from 'react';
-import { AGENT_ID, BACKEND_MODELS, PRESETS, storageSet } from '../lib';
+import { BACKEND_MODELS, PRESETS, formatBytes, storageSet } from '../lib';
 
-export default function ChatSidebar({
-  prompt, setPrompt, running, runTask, image, attachImage, setImage,
+export default function SandboxComposer({
+  prompt, setPrompt, running, runTask,
+  image, attachImage, setImage,
+  files, attachFiles, setFiles,
   envMode, setEnvMode, envId, setEnvId, freshSession, setFreshSession,
-  sources, setSources, selectedBackend, setBackendModel, customModel, setCustomModel,
+  sources, setSources,
+  selectedBackend, setBackendModel, customModel, setCustomModel,
   maxTokens, setMaxTokens, tools, setTools, mcp, setMcp,
-  useProxy, setUseProxy, proxyUrl, setProxyUrl,
-  sessions, activeSessionId, setActiveSessionId, showTurn, expanded, setExpanded, deleteSession,
-  setLastInteractionId, setOutput, setSteps,
-  adminToken, setAdminToken, upstreamKeysCount, loadGateway,
-  apiKey, setKeyModal, setKeyDraft
+  sessions, activeSessionId, showTurn, expanded, setExpanded, deleteSession,
+  lastInteractionId, setLastInteractionId, setOutput, setSteps,
+  setActiveSessionId,
+  sandboxKeyId, setSandboxKeyId, upstreamKeys = []
 }) {
-  const [showCustomModelInput, setShowCustomModelInput] = useState(false);
+  const [showCustomModelInput, setShowCustomModelInput] = useState(Boolean(customModel));
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const enabledKeys = upstreamKeys.filter((key) => key.enabled);
+  const selectedKey = enabledKeys.find((key) => key.id === sandboxKeyId) || null;
+
+  function onPickFiles(list) {
+    const incoming = [...(list || [])];
+    if (!incoming.length) return;
+    void attachFiles(incoming);
+  }
 
   return (
-    <aside className="sidebar">
-      {/* Group 1: API 网关与连接配置 */}
-      <section className="card">
-        <div className="card-head">
-          <h2 style={{ margin: 0 }}>📡 网关与服务状态</h2>
-          <span className="badge ok">{upstreamKeysCount || 0} 个 Key 就绪</span>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <label className="label">管理 Token (GATEWAY_ADMIN_TOKEN)</label>
-          <div className="row">
-            <input
-              className="input mono grow"
-              type="password"
-              value={adminToken}
-              onChange={(e) => { setAdminToken(e.target.value); storageSet('antigravity_gateway_admin_token', e.target.value); }}
-              placeholder="管理 Token"
-            />
-            <button className="btn btn-sm" onClick={loadGateway}>保存/刷新</button>
-          </div>
-        </div>
-
-        <div style={{ marginTop: 10 }}>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={useProxy}
-              onChange={(e) => { setUseProxy(e.target.checked); storageSet('antigravity_use_proxy', e.target.checked); }}
-            />
-            <span>启用 HTTP/HTTPS 代理</span>
-          </label>
-          {useProxy && (
-            <input
-              className="input mono"
-              style={{ marginTop: 4 }}
-              value={proxyUrl}
-              onChange={(e) => { setProxyUrl(e.target.value); storageSet('antigravity_proxy_url', e.target.value); }}
-              placeholder="http://127.0.0.1:7890"
-            />
-          )}
-        </div>
-      </section>
-
-      {/* Group 2: 沙盒调试 (Agent 交互) */}
+    <div className="sandbox-composer">
       <section className="card primary">
-        <h2>🧪 沙盒 Agent 调试</h2>
-        <div className="pills">
+        <div className="card-head">
+          <h2 style={{ margin: 0 }}>提交沙盒任务</h2>
+          <span className="badge ok">{files.length} 个文件</span>
+        </div>
+        <p className="hint">
+          网页提交会<strong>直接</strong>使用下方选中的上游 Key 调用 Gemini Interactions，
+          不走协议网关的 clone / fork / 100k TPM 限额。复用会话时请继续用创建该沙盒的同一把 Key。
+        </p>
+
+        <label className="label">本次使用的上游 Key</label>
+        <select
+          className="select"
+          value={sandboxKeyId || ''}
+          onChange={(e) => {
+            setSandboxKeyId(e.target.value);
+            storageSet('antigravity_sandbox_key_id', e.target.value);
+          }}
+        >
+          <option value="">{enabledKeys.length ? '请选择 Key' : '请先在「上游 Key」页添加'}</option>
+          {enabledKeys.map((key) => (
+            <option key={key.id} value={key.id}>
+              {key.name} …{key.suffix || '****'}
+              {key.rpdExhausted ? '（今日额度已用尽，仍可强制直连）' : ''}
+            </option>
+          ))}
+        </select>
+        {selectedKey && (
+          <p className="hint">
+            {selectedKey.proxyUrl ? `该 Key 代理: ${selectedKey.proxyUrl} · ` : ''}
+            今日 {selectedKey.rpdUsed ?? 0}/{selectedKey.rpdLimit ?? 100}
+          </p>
+        )}
+
+        <div className="pills" style={{ marginTop: 10 }}>
           <button className="pill" onClick={() => setPrompt(PRESETS.news)}>新闻 PDF</button>
           <button className="pill" onClick={() => setPrompt(PRESETS.data)}>CSV 图表</button>
           <button className="pill" onClick={() => setPrompt(PRESETS.code)}>Node/Python</button>
@@ -68,30 +69,69 @@ export default function ChatSidebar({
         <textarea
           className="textarea"
           value={prompt}
-          placeholder="描述要在远程沙盒中执行的任务，可 Ctrl+V 粘贴截图"
+          placeholder="描述要在远程沙盒中执行的任务。可拖入文件塞进 /workspace，Ctrl+V 也可贴截图。"
           onChange={(e) => setPrompt(e.target.value)}
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => {
             e.preventDefault();
-            const file = e.dataTransfer.files?.[0];
-            if (file) attachImage(file);
+            const dropped = [...(e.dataTransfer.files || [])];
+            if (!dropped.length) return;
+            const images = dropped.filter((file) => file.type.startsWith('image/'));
+            const rest = dropped.filter((file) => !file.type.startsWith('image/'));
+            if (images[0]) attachImage(images[0]);
+            if (rest.length) onPickFiles(rest);
+            if (!rest.length && images.length > 1) onPickFiles(images.slice(1));
           }}
           onPaste={(e) => {
-            const item = [...(e.clipboardData?.items || [])].find((entry) => entry.type.startsWith('image/'));
-            if (item) {
+            const items = [...(e.clipboardData?.items || [])];
+            const imageItem = items.find((entry) => entry.type.startsWith('image/'));
+            if (imageItem) {
               e.preventDefault();
-              attachImage(item.getAsFile());
+              attachImage(imageItem.getAsFile());
             }
           }}
         />
-        <div className="row" style={{ marginTop: 8 }}>
+
+        <div className="row" style={{ marginTop: 8, flexWrap: 'wrap' }}>
           <label className="btn btn-sm">
-            添加图片
+            塞入沙盒文件
+            <input
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                onPickFiles(e.target.files);
+                e.target.value = '';
+              }}
+            />
+          </label>
+          <label className="btn btn-sm">
+            添加图片（视觉输入）
             <input type="file" accept="image/*" hidden onChange={(e) => attachImage(e.target.files?.[0])} />
           </label>
           {image && <button className="btn btn-sm btn-danger" onClick={() => setImage(null)}>移除图片</button>}
+          {files.length > 0 && (
+            <button className="btn btn-sm btn-danger" onClick={() => setFiles([])}>清空文件</button>
+          )}
         </div>
         {image && <div className="preview"><img src={image.preview} alt="" /></div>}
+        {files.length > 0 && (
+          <div className="file-chip-list">
+            {files.map((file, index) => (
+              <div className="file-chip" key={`${file.target}-${index}`}>
+                <div>
+                  <div className="file-chip-name">{file.name || file.target}</div>
+                  <div className="hint mono">{file.target} · {formatBytes(file.size)} · {file.encoding === 'base64' ? '二进制' : '文本'}</div>
+                </div>
+                <button className="btn btn-sm btn-danger" onClick={() => setFiles((list) => list.filter((_, i) => i !== index))}>移除</button>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="hint">
+          新建沙盒时，文件会作为 environment.sources 写入 <code>/workspace</code>。
+          复用已有沙盒时，会先让 Agent 把文件写进当前环境。
+        </p>
 
         <div style={{ marginTop: 12 }}>
           <span className="label">沙盒运行环境</span>
@@ -110,7 +150,7 @@ export default function ChatSidebar({
             </>
           )}
           {envMode === 'new' && (
-            <button className="btn btn-sm" style={{ marginTop: 6 }} onClick={() => setSources((list) => [...list, { target: '', content: '' }])}>+ 注入预置文件</button>
+            <button className="btn btn-sm" style={{ marginTop: 6 }} onClick={() => setSources((list) => [...list, { target: '', content: '', encoding: 'utf8' }])}>+ 手动文本文件</button>
           )}
           {sources.map((source, index) => (
             <div key={index} className="box" style={{ marginTop: 8 }}>
@@ -162,12 +202,26 @@ export default function ChatSidebar({
           <label className="check"><input type="checkbox" checked={tools.url} onChange={(e) => setTools((t) => ({ ...t, url: e.target.checked }))} /><span>URL Context<small>抓取指定 URL</small></span></label>
         </div>
 
+        <button className="btn btn-ghost" style={{ marginTop: 8 }} onClick={() => setShowAdvanced((v) => !v)}>
+          {showAdvanced ? '收起高级选项' : '高级选项（max tokens / MCP）'}
+        </button>
+        {showAdvanced && (
+          <div style={{ marginTop: 8 }}>
+            <label className="label">maxTotalTokens</label>
+            <input className="input" value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} placeholder="可选" />
+            <label className="label" style={{ marginTop: 8 }}>远程 MCP</label>
+            <div className="row">
+              <input className="input grow" value={mcp.name} onChange={(e) => setMcp((m) => ({ ...m, name: e.target.value }))} placeholder="name" />
+              <input className="input grow" value={mcp.url} onChange={(e) => setMcp((m) => ({ ...m, url: e.target.value }))} placeholder="https://..." />
+            </div>
+          </div>
+        )}
+
         <button className="btn btn-primary" style={{ marginTop: 14 }} disabled={running} onClick={runTask}>
-          {running ? '执行中…' : '🚀 提交沙盒任务'}
+          {running ? '执行中…' : '提交沙盒任务'}
         </button>
       </section>
 
-      {/* Group 3: 会话历史 */}
       <section className="card">
         <div className="card-head">
           <h2 style={{ margin: 0 }}>沙盒历史会话</h2>
@@ -187,7 +241,7 @@ export default function ChatSidebar({
                   <div>
                     <button className="btn-ghost" onClick={(e) => { e.stopPropagation(); setExpanded((set) => { const next = new Set(set); next.has(session.id) ? next.delete(session.id) : next.add(session.id); return next; }); }}>{open ? '▾' : '▸'}</button>
                     <div className="session-title">{session.name || session.envId}</div>
-                    <div className="session-env mono">{session.envId}</div>
+                    <div className="session-env mono">{session.envId}{session.upstreamKeyId ? ` · key ${session.upstreamKeyId.slice(0, 8)}` : ''}</div>
                   </div>
                   <button className="btn btn-sm btn-danger" onClick={(e) => { e.stopPropagation(); deleteSession(session.id); }}>删除</button>
                 </div>
@@ -205,6 +259,6 @@ export default function ChatSidebar({
           })}
         </div>
       </section>
-    </aside>
+    </div>
   );
 }

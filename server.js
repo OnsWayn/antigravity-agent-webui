@@ -9,6 +9,12 @@ const { createOriginGuard } = require('./http-security');
 const { SnapshotCache } = require('./snapshot-cache');
 const { createGatewayRouter } = require('./gateway/routes');
 const { createAdminRouter } = require('./gateway/admin-routes');
+const {
+  resolveSandboxCredentials,
+  resolveSandboxProxy,
+  resolveSandboxModel,
+  applySandboxFiles
+} = require('./sandbox');
 
 try {
   process.loadEnvFile(path.join(__dirname, '.env'));
@@ -352,7 +358,12 @@ async function callGeminiInteractionsApi(apiKey, payload, proxyConfig = {}) {
 
 // Local persistence API. API keys intentionally never enter this database.
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, storage: { type: 'sqlite', ...database.stats() } });
+  res.json({
+    success: true,
+    version: '1.8.0',
+    sandboxDirectKey: true,
+    storage: { type: 'sqlite', ...database.stats() }
+  });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -387,62 +398,74 @@ app.delete('/api/sessions/:sessionId', (req, res) => {
   }
 });
 
-// 1. Create or Continue Interaction
-app.post('/api/interactions/create', async (req, res) => {
-  const apiKey = req.headers['x-goog-api-key'] || req.body.apiKey;
-  if (!apiKey) {
-    logMessage('warn', 'Request rejected: Missing GEMINI API Key');
-    return res.status(400).json({
+function resolveSandboxRequest(req, res) {
+  try {
+    const credentials = resolveSandboxCredentials(req, {
+      database,
+      masterKey: GATEWAY_MASTER_KEY,
+      adminToken: GATEWAY_ADMIN_TOKEN
+    });
+    const proxyConfig = resolveSandboxProxy(req.body || {}, credentials);
+    return { credentials, proxyConfig };
+  } catch (error) {
+    const status = error.status && error.status >= 400 && error.status < 600 ? error.status : 400;
+    logMessage('warn', 'Sandbox credential resolution failed', {
+      code: error.code,
+      message: error.message
+    });
+    res.status(status).json({
       success: false,
       error: {
-        code: 'MISSING_API_KEY',
-        message: '未提供 GEMINI API Key，请在控制台右上角配置您的 API Key。'
+        code: error.code || 'MISSING_API_KEY',
+        message: error.message || '未提供可用的沙盒 Key'
       }
     });
+    return null;
   }
+}
+
+// 1. Create or Continue Interaction
+// WebUI submissions pick an upstream key and call Gemini Interactions directly.
+// They do not enter the protocol gateway, so clone / fork / 100k TPM rules do not apply.
+app.post('/api/interactions/create', async (req, res) => {
+  const resolved = resolveSandboxRequest(req, res);
+  if (!resolved) return;
+  const { credentials, proxyConfig } = resolved;
+  const apiKey = credentials.apiKey;
 
   const {
     agent = 'antigravity-preview-05-2026',
     input,
     environment = 'remote',
-    sources,
     model = 'gemini-3.7-flash',
     maxTotalTokens,
     tools,
     previousInteractionId,
     localSessionId,
-    startNewSession = false,
-    useProxy,
-    proxyUrl
+    startNewSession = false
   } = req.body;
   const shouldStartNewSession = startNewSession === true;
 
   const payload = {
     agent,
     input,
+    environment
   };
 
-  if (typeof environment === 'string') {
-    if (sources && Array.isArray(sources) && sources.length > 0) {
-      payload.environment = {
-        type: 'remote',
-        sources: sources.map(s => ({
-          type: 'inline',
-          target: s.target,
-          content: s.content,
-        })),
-      };
-    } else {
-      payload.environment = environment;
-    }
-  } else {
-    payload.environment = environment;
+  try {
+    applySandboxFiles(payload, req.body);
+  } catch (error) {
+    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 400).json({
+      success: false,
+      error: { code: error.code || 'INVALID_SOURCES', message: error.message }
+    });
   }
 
   const agentConfig = {
-    type: 'antigravity',
-    model,
+    type: 'antigravity'
   };
+  const resolvedModel = resolveSandboxModel(model);
+  if (resolvedModel) agentConfig.model = resolvedModel;
   if (maxTotalTokens && Number(maxTotalTokens) > 0) {
     agentConfig.max_total_tokens = Number(maxTotalTokens);
   }
@@ -457,7 +480,7 @@ app.post('/api/interactions/create', async (req, res) => {
   }
 
   try {
-    const result = await callGeminiInteractionsApi(apiKey, payload, { useProxy, proxyUrl });
+    const result = await callGeminiInteractionsApi(apiKey, payload, proxyConfig);
     const environmentId = result.environment_id ||
       (typeof environment === 'string' && environment !== 'remote' ? environment : null);
     const outputText = result.output_text || '';
@@ -474,7 +497,8 @@ app.post('/api/interactions/create', async (req, res) => {
         model,
         usage: result.usage,
         request: sanitizeForStorage(payload),
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        upstreamKeyId: credentials.keyId || undefined
       });
       result.local_session_id = savedInteraction?.sessionId || localSessionId || null;
       snapshotCache.invalidate(environmentId);
@@ -515,15 +539,12 @@ app.post('/api/interactions/create', async (req, res) => {
 
 // 2. Fetch/Download File Endpoint - Chunked Safe Extraction (No Gemini Safety Refusal & No Truncation)
 app.post('/api/interactions/fetch-file', async (req, res) => {
-  const apiKey = req.headers['x-goog-api-key'] || req.body.apiKey;
-  const { environmentId, filePath, useProxy, proxyUrl, provider = 'snapshot', forceRefresh = false } = req.body;
-
-  if (!apiKey) {
-    return res.status(400).json({
-      success: false,
-      error: { code: 'MISSING_API_KEY', message: 'Missing GEMINI API Key' }
-    });
-  }
+  const resolved = resolveSandboxRequest(req, res);
+  if (!resolved) return;
+  const { credentials, proxyConfig } = resolved;
+  const apiKey = credentials.apiKey;
+  const { environmentId, filePath, provider = 'snapshot', forceRefresh = false } = req.body;
+  const { useProxy, proxyUrl } = proxyConfig;
   if (!environmentId || !filePath) {
     return res.status(400).json({
       success: false,

@@ -87,6 +87,150 @@ a { color: var(--cyan); }
   grid-template-rows: 56px 1fr;
 }
 
+.app-shell {
+  height: 100%;
+  display: grid;
+  grid-template-columns: 228px 1fr;
+  grid-template-rows: auto 1fr;
+}
+
+.app-shell > .header {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+.app-nav {
+  grid-column: 1;
+  grid-row: 2;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  padding: 14px 10px 20px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 0;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 8px;
+}
+.nav-title {
+  font-size: 13px;
+  font-weight: 650;
+}
+.nav-sub {
+  font-size: 11px;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav-group-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 8px 10px 6px;
+}
+
+.nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--muted);
+}
+.nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.nav-item.active {
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.28);
+}
+.nav-item-label { font-size: 13px; font-weight: 600; }
+.nav-item-hint { font-size: 11px; color: var(--faint); }
+
+.nav-toggle {
+  display: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+}
+.nav-backdrop { display: none; }
+
+.app-main {
+  grid-column: 2;
+  grid-row: 2;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+  background: var(--bg);
+}
+
+.sandbox-page {
+  display: grid;
+  grid-template-columns: minmax(280px, 380px) 1fr;
+  gap: 16px;
+  min-height: calc(100vh - 96px);
+  align-items: start;
+}
+.sandbox-composer,
+.sandbox-trace { min-width: 0; }
+.sandbox-composer { display: flex; flex-direction: column; gap: 14px; }
+
+.file-chip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.file-chip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+.file-chip-name { font-size: 13px; font-weight: 600; }
+
+.dash-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.dash-card {
+  text-align: left;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dash-card:hover { border-color: var(--border-hover); background: var(--bg-hover); }
+.dash-card b { font-size: 22px; }
+
 /* ── Header (glass) ── */
 .header {
   display: flex;
@@ -1006,8 +1150,39 @@ a { color: var(--cyan); }
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
-  .stats { display: none; }
+  .header .stats { display: none; }
   .header { padding: 0 16px; flex-direction: column; height: auto; padding-bottom: 10px; gap: 8px; }
   .workspace-body { padding: 16px; }
   .header-status-bar { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+  .nav-toggle { display: grid; place-items: center; }
+  .app-nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    z-index: 40;
+    transform: translateX(-110%);
+    transition: transform var(--transition);
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .app-main {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .app-shell:has(.nav-backdrop) .app-nav { transform: none; }
+  .nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    z-index: 30;
+    grid-column: 1 / -1;
+    grid-row: 1 / -1;
+  }
+  .sandbox-page { grid-template-columns: 1fr; }
 }

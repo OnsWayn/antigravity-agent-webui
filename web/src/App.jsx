@@ -3,21 +3,25 @@ import {
   AGENT_ID,
   APP_VERSION,
   BACKEND_MODELS,
-  PRESETS,
   decodeHeader,
   downloadBase64,
   downloadBlob,
   extractOutputText,
   findArtifactPaths,
+  pageFromHash,
+  pageHash,
+  readFileAsSource,
   storageGet,
   storageRemove,
   storageSet
 } from './lib';
 
+import AppNav from './components/AppNav';
 import ArtifactsView from './components/ArtifactsView';
-import ChatSidebar from './components/ChatSidebar';
+import DashboardView from './components/DashboardView';
 import GatewayPanel from './components/GatewayPanel';
 import LogDashboard from './components/LogDashboard';
+import SandboxComposer from './components/SandboxComposer';
 import TraceView from './components/TraceView';
 
 function json(value) {
@@ -25,11 +29,12 @@ function json(value) {
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useState(() => storageGet('antigravity_gemini_api_key'));
-  const [keyModal, setKeyModal] = useState(false);
-  const [keyDraft, setKeyDraft] = useState('');
+  const [page, setPage] = useState(() => (typeof window === 'undefined' ? 'dashboard' : pageFromHash()));
+  const [navOpen, setNavOpen] = useState(false);
+  const [sandboxKeyId, setSandboxKeyId] = useState(() => storageGet('antigravity_sandbox_key_id'));
   const [prompt, setPrompt] = useState('');
   const [image, setImage] = useState(null);
+  const [files, setFiles] = useState([]);
   const [envMode, setEnvMode] = useState('new');
   const [envId, setEnvId] = useState('');
   const [freshSession, setFreshSession] = useState(false);
@@ -38,7 +43,7 @@ export default function App() {
   const [expanded, setExpanded] = useState(() => new Set());
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [lastInteractionId, setLastInteractionId] = useState('');
-  const [backendModel, setBackendModel] = useState(() => storageGet('antigravity_selected_model', 'gemini-3.7-flash'));
+  const [backendModel, setBackendModel] = useState(() => storageGet('antigravity_selected_model', 'auto'));
   const [customModel, setCustomModel] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [tools, setTools] = useState({ code: true, search: true, url: true });
@@ -46,8 +51,6 @@ export default function App() {
   const [useProxy, setUseProxy] = useState(() => storageGet('antigravity_use_proxy', 'false') === 'true');
   const [proxyUrl, setProxyUrl] = useState(() => storageGet('antigravity_proxy_url', 'http://127.0.0.1:10808'));
 
-  // Default to gateway tab (Module 2 requirement)
-  const [tab, setTab] = useState('gateway');
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState('IDLE');
   const [tokens, setTokens] = useState('0');
@@ -71,9 +74,22 @@ export default function App() {
 
   const selectedBackend = customModel.trim()
     ? customModel.trim()
-    : (BACKEND_MODELS.some((m) => m.id === backendModel) ? backendModel : 'gemini-3.7-flash');
+    : (BACKEND_MODELS.some((m) => m.id === backendModel) ? backendModel : 'auto');
 
-  const proxySettings = () => ({ useProxy, proxyUrl: proxyUrl.trim() });
+  useEffect(() => {
+    function onHash() {
+      setPage(pageFromHash());
+    }
+    window.addEventListener('hashchange', onHash);
+    if (!window.location.hash) window.location.hash = pageHash(pageFromHash());
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  function go(id) {
+    setPage(id);
+    window.location.hash = pageHash(id);
+    setNavOpen(false);
+  }
 
   async function refreshSessions(imported = []) {
     if (imported.length) {
@@ -98,18 +114,9 @@ export default function App() {
       legacy = raw ? JSON.parse(raw) : [];
     } catch { legacy = []; }
     refreshSessions(legacy).then(() => {
-      if (legacy.length) {
-        storageRemove('antigravity_sessions');
-      }
+      if (legacy.length) storageRemove('antigravity_sessions');
     }).catch(() => {});
   }, []);
-
-  function saveKey() {
-    const value = keyDraft.trim();
-    setApiKey(value);
-    storageSet('antigravity_gemini_api_key', value);
-    setKeyModal(false);
-  }
 
   function attachImage(file) {
     if (!file || !file.type.startsWith('image/')) return;
@@ -119,6 +126,16 @@ export default function App() {
       setImage({ mime: file.type, data: dataUrl.split(',')[1], preview: dataUrl, name: file.name });
     };
     reader.readAsDataURL(file);
+  }
+
+  async function attachFiles(fileList) {
+    const incoming = [...(fileList || [])].filter(Boolean);
+    if (!incoming.length) return;
+    const next = [];
+    for (const file of incoming) {
+      next.push(await readFileAsSource(file));
+    }
+    setFiles((list) => [...list, ...next]);
   }
 
   function showTurn(session, turn) {
@@ -132,7 +149,11 @@ export default function App() {
     setSteps(turn?.steps || session.steps || []);
     setArtifacts(findArtifactPaths(text));
     setStatus((turn?.status || 'VIEW').toUpperCase());
-    setTab('trace');
+    if (session.upstreamKeyId) {
+      setSandboxKeyId(session.upstreamKeyId);
+      storageSet('antigravity_sandbox_key_id', session.upstreamKeyId);
+    }
+    go('sandbox');
   }
 
   async function deleteSession(sessionId) {
@@ -166,15 +187,48 @@ export default function App() {
     return list;
   }
 
+  function sandboxHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      ...(adminToken ? {
+        Authorization: `Bearer ${adminToken}`,
+        'x-gateway-admin-token': adminToken
+      } : {}),
+      ...(sandboxKeyId ? { 'x-upstream-key-id': sandboxKeyId } : {})
+    };
+  }
+
+  function collectSources() {
+    const uploaded = files.map((file) => ({
+      target: file.target,
+      content: file.content,
+      encoding: file.encoding || 'utf8',
+      name: file.name
+    }));
+    const typed = sources
+      .filter((item) => item.target.trim() && item.content)
+      .map((item) => ({
+        target: item.target.trim(),
+        content: item.content,
+        encoding: item.encoding || 'utf8'
+      }));
+    return [...uploaded, ...typed];
+  }
+
   async function runTask() {
-    if (!apiKey) {
-      setKeyDraft(apiKey);
-      setKeyModal(true);
+    if (!adminToken) {
+      go('settings');
+      setGatewayError('网页提交沙盒任务需要管理 Token，以便从 Key 池解密所选 Key。');
       return;
     }
-    if (!prompt.trim()) return;
+    if (!sandboxKeyId) {
+      go('keys');
+      setGatewayError('请先在「上游 Key」添加并选择一把 Key。网页提交不再使用单独的浏览器 Key。');
+      return;
+    }
+    if (!prompt.trim() && files.length === 0) return;
     const input = image
-      ? [{ type: 'text', text: prompt.trim() }, { type: 'image', mime_type: image.mime, data: image.data }]
+      ? [{ type: 'text', text: prompt.trim() || '请查看附件并完成任务。' }, { type: 'image', mime_type: image.mime, data: image.data }]
       : prompt.trim();
 
     let environment = 'remote';
@@ -193,33 +247,31 @@ export default function App() {
           previousInteractionId = fallback?.lastInteractionId || lastInteractionId || undefined;
         }
       }
-    } else {
-      const filled = sources.filter((item) => item.target.trim() && item.content);
-      if (filled.length) {
-        environment = { type: 'remote', sources: filled.map((item) => ({ type: 'inline', target: item.target, content: item.content })) };
-      }
     }
 
     const requestBody = {
       agent: AGENT_ID,
       input,
       environment,
+      sources: collectSources(),
       model: selectedBackend,
       maxTotalTokens: maxTokens ? Number(maxTokens) : undefined,
       tools: builtTools().length ? builtTools() : undefined,
       previousInteractionId,
       localSessionId,
       startNewSession,
-      ...proxySettings()
+      upstreamKeyId: sandboxKeyId,
+      useProxy,
+      proxyUrl: proxyUrl.trim()
     };
     setLastRequest(requestBody);
     setRunning(true);
     setStatus('RUNNING');
-    setTab('trace');
+    go('sandbox');
     try {
       const response = await fetch('/api/interactions/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        headers: sandboxHeaders(),
         body: JSON.stringify(requestBody)
       });
       const resJson = await response.json();
@@ -232,6 +284,8 @@ export default function App() {
       const data = resJson.data;
       const text = extractOutputText(data);
       setPrompt('');
+      setFiles([]);
+      setSources([]);
       setLastInteractionId(data.id || '');
       const nextEnv = data.environment_id || envId;
       setEnvId(nextEnv);
@@ -257,21 +311,27 @@ export default function App() {
       setFileStatus({ error: '需要文件路径和 Environment ID' });
       return;
     }
+    if (!sandboxKeyId) {
+      setFileStatus({ error: '请先选择网页提交使用的上游 Key' });
+      return;
+    }
     setFileStatus({ pending: `正在通过 ${provider} 提取 ${path}` });
-    const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
-    if (provider === 'snapshot') headers.Accept = 'application/octet-stream';
     try {
       const res = await fetch('/api/interactions/fetch-file', {
         method: 'POST',
-        headers,
+        headers: {
+          ...sandboxHeaders(),
+          ...(provider === 'snapshot' ? { Accept: 'application/octet-stream' } : {})
+        },
         body: JSON.stringify({
-          apiKey,
           environmentId: envId,
           previousInteractionId: lastInteractionId || undefined,
           filePath: path,
           provider,
           forceRefresh: provider === 'snapshot' && forceRefresh,
-          ...proxySettings()
+          upstreamKeyId: sandboxKeyId,
+          useProxy,
+          proxyUrl: proxyUrl.trim()
         })
       });
       if (provider === 'snapshot' && res.ok && res.headers.get('content-type')?.includes('application/octet-stream')) {
@@ -307,13 +367,13 @@ export default function App() {
   }
 
   async function zipWorkspace() {
-    if (!envId || !apiKey) return;
+    if (!envId || !sandboxKeyId) return;
     setFilePath('/tmp/workspace_project.zip');
     setFileStatus({ pending: '正在打包 /workspace ...' });
     try {
       const response = await fetch('/api/interactions/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        headers: sandboxHeaders(),
         body: JSON.stringify({
           agent: AGENT_ID,
           input: 'You must use the code_execution tool now. Execute exactly: cd /workspace && python3 -c "import shutil; shutil.make_archive(\'/tmp/workspace_project\', \'zip\', \'/workspace\')". Then execute: test -s /tmp/workspace_project.zip && ls -lh /tmp/workspace_project.zip.',
@@ -323,7 +383,9 @@ export default function App() {
           previousInteractionId: lastInteractionId || undefined,
           localSessionId: activeSessionId || undefined,
           startNewSession: false,
-          ...proxySettings()
+          upstreamKeyId: sandboxKeyId,
+          useProxy,
+          proxyUrl: proxyUrl.trim()
         })
       });
       const resData = await response.json();
@@ -366,8 +428,15 @@ export default function App() {
         gatewayFetch('/api/gateway/keys'),
         gatewayFetch('/api/gateway/tokens')
       ]);
-      setUpstreamKeys(keys.keys || []);
+      const list = keys.keys || [];
+      setUpstreamKeys(list);
       setClientTokens(tokensRes.tokens || []);
+      setSandboxKeyId((current) => {
+        if (current && list.some((item) => item.id === current)) return current;
+        const first = list.find((item) => item.enabled)?.id || list[0]?.id || '';
+        if (first) storageSet('antigravity_sandbox_key_id', first);
+        return first;
+      });
     } catch (err) {
       setGatewayError(err.message);
     }
@@ -378,19 +447,50 @@ export default function App() {
   }, [loadGateway]);
 
   const activeKeysCount = upstreamKeys.filter((k) => k.enabled).length;
+  const selectedKey = upstreamKeys.find((key) => key.id === sandboxKeyId);
+
+  const pageTitle = {
+    dashboard: '仪表盘',
+    sandbox: '沙盒任务',
+    artifacts: '文件提取',
+    gateway: '协议概览',
+    keys: '上游 Key',
+    tokens: '下游 Token',
+    logs: '请求日志',
+    settings: '运行设置',
+    docs: '说明文档'
+  }[page] || 'Antigravity';
+
+  const gatewayPanelProps = {
+    adminToken,
+    setAdminToken,
+    gatewayStatus,
+    gatewayError,
+    setGatewayError,
+    upstreamKeys,
+    clientTokens,
+    loadGateway,
+    gatewayFetch,
+    selectedBackend,
+    gatewaySettings,
+    useProxy,
+    setUseProxy,
+    proxyUrl,
+    setProxyUrl
+  };
 
   return (
-    <div className="app">
-      {/* Header with Global Status Bar */}
+    <div className="app-shell">
       <header className="header">
         <div className="brand">
+          <button className="nav-toggle" onClick={() => setNavOpen((open) => !open)} aria-label="打开导航">☰</button>
           <div className="logo">A</div>
           <div>
             <h1>
               Antigravity Studio <span className="tag">{AGENT_ID}</span>
               <span className="version-badge">v{APP_VERSION}</span>
             </h1>
-            <p>Managed Agent · Remote Sandbox · Protocol Gateway</p>
+            <p>{pageTitle} · 功能分页管理后台</p>
           </div>
         </div>
 
@@ -399,179 +499,149 @@ export default function App() {
             <span className={`dot ${gatewayStatus?.enabled ? 'ok' : 'warn'}`} />
             <span>网关{gatewayStatus?.enabled ? '运行中' : '已关闭'}</span>
           </div>
-
           <div className="status-pill">
             <span>🔑 {activeKeysCount}/{upstreamKeys.length} 个 Key</span>
           </div>
-
           <div className="status-pill">
-            <span className={`dot ${apiKey ? 'ok' : 'warn'}`} />
-            <span>{apiKey ? '沙盒 Key 已就绪' : '未配沙盒 Key'}</span>
+            <span className={`dot ${selectedKey ? 'ok' : 'warn'}`} />
+            <span>{selectedKey ? `网页 Key ${selectedKey.name}` : '未选网页提交 Key'}</span>
           </div>
-
-          <button className="btn btn-sm" onClick={() => { setKeyDraft(apiKey); setKeyModal(true); }}>
-            沙盒 Key
-          </button>
+          <div className="stats">
+            <span>状态 <b className={`badge ${status === 'ERROR' ? 'err' : status === 'RUNNING' ? 'run' : 'ok'}`}>{status}</b></span>
+            <span>Tokens {tokens}</span>
+            <span className="mono">{envId || 'no env'}</span>
+          </div>
         </div>
       </header>
 
-      <div className="layout">
-        {/* Left: Chat & Gateway Sidebar */}
-        <ChatSidebar
-          prompt={prompt}
-          setPrompt={setPrompt}
-          running={running}
-          runTask={runTask}
-          image={image}
-          attachImage={attachImage}
-          setImage={setImage}
-          envMode={envMode}
-          setEnvMode={setEnvMode}
-          envId={envId}
-          setEnvId={setEnvId}
-          freshSession={freshSession}
-          setFreshSession={setFreshSession}
-          sources={sources}
-          setSources={setSources}
-          selectedBackend={selectedBackend}
-          setBackendModel={setBackendModel}
-          customModel={customModel}
-          setCustomModel={setCustomModel}
-          maxTokens={maxTokens}
-          setMaxTokens={setMaxTokens}
-          tools={tools}
-          setTools={setTools}
-          mcp={mcp}
-          setMcp={setMcp}
-          useProxy={useProxy}
-          setUseProxy={setUseProxy}
-          proxyUrl={proxyUrl}
-          setProxyUrl={setProxyUrl}
-          sessions={sessions}
-          activeSessionId={activeSessionId}
-          setActiveSessionId={setActiveSessionId}
-          showTurn={showTurn}
-          expanded={expanded}
-          setExpanded={setExpanded}
-          deleteSession={deleteSession}
-          setLastInteractionId={setLastInteractionId}
-          setOutput={setOutput}
-          setSteps={setSteps}
-          adminToken={adminToken}
-          setAdminToken={setAdminToken}
-          upstreamKeysCount={activeKeysCount}
-          loadGateway={loadGateway}
-          apiKey={apiKey}
-          setKeyModal={setKeyModal}
-          setKeyDraft={setKeyDraft}
-        />
+      {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
 
-        {/* Right Workspace Area */}
-        <main className="workspace">
-          {/* Reordered Tabs: Gateway -> Logs -> Trace -> Artifacts -> Docs */}
-          <div className="tabs">
-            {[
-              ['gateway', '🌐 协议中转'],
-              ['logs', '📊 日志控制台'],
-              ['trace', '⚡ 沙盒调试'],
-              ['artifacts', '📁 文件提取'],
-              ['docs', '📖 说明']
-            ].map(([id, label]) => (
-              <button key={id} className={`tab ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)}>
-                {label}
-              </button>
-            ))}
-            <div className="stats">
-              <span>状态 <b className={`badge ${status === 'ERROR' ? 'err' : status === 'RUNNING' ? 'run' : 'ok'}`}>{status}</b></span>
-              <span>Tokens {tokens}</span>
-              <span className="mono">{envId || 'no env'}</span>
+      <AppNav page={page} setPage={go} onNavigate={() => setNavOpen(false)} />
+
+      <main className="app-main">
+        {gatewayError && page !== 'settings' && page !== 'keys' && page !== 'gateway' && (
+          <p className="status-bad" style={{ marginBottom: 12 }}>{gatewayError}</p>
+        )}
+
+        {page === 'dashboard' && (
+          <DashboardView
+            gatewayStatus={gatewayStatus}
+            upstreamKeys={upstreamKeys}
+            clientTokens={clientTokens}
+            sessions={sessions}
+            setPage={go}
+            sandboxKeyId={sandboxKeyId}
+          />
+        )}
+
+        {page === 'sandbox' && (
+          <div className="sandbox-page">
+            <SandboxComposer
+              prompt={prompt}
+              setPrompt={setPrompt}
+              running={running}
+              runTask={runTask}
+              image={image}
+              attachImage={attachImage}
+              setImage={setImage}
+              files={files}
+              attachFiles={attachFiles}
+              setFiles={setFiles}
+              envMode={envMode}
+              setEnvMode={setEnvMode}
+              envId={envId}
+              setEnvId={setEnvId}
+              freshSession={freshSession}
+              setFreshSession={setFreshSession}
+              sources={sources}
+              setSources={setSources}
+              selectedBackend={selectedBackend}
+              setBackendModel={setBackendModel}
+              customModel={customModel}
+              setCustomModel={setCustomModel}
+              maxTokens={maxTokens}
+              setMaxTokens={setMaxTokens}
+              tools={tools}
+              setTools={setTools}
+              mcp={mcp}
+              setMcp={setMcp}
+              sessions={sessions}
+              activeSessionId={activeSessionId}
+              showTurn={showTurn}
+              expanded={expanded}
+              setExpanded={setExpanded}
+              deleteSession={deleteSession}
+              lastInteractionId={lastInteractionId}
+              setLastInteractionId={setLastInteractionId}
+              setOutput={setOutput}
+              setSteps={setSteps}
+              setActiveSessionId={setActiveSessionId}
+              sandboxKeyId={sandboxKeyId}
+              setSandboxKeyId={setSandboxKeyId}
+              upstreamKeys={upstreamKeys}
+            />
+            <div className="sandbox-trace">
+              <TraceView output={output} steps={steps} running={running} json={json} />
             </div>
           </div>
+        )}
 
-          <div className="workspace-body">
-            {tab === 'gateway' && (
-              <GatewayPanel
-                adminToken={adminToken}
-                setAdminToken={setAdminToken}
-                gatewayStatus={gatewayStatus}
-                gatewayError={gatewayError}
-                setGatewayError={setGatewayError}
-                upstreamKeys={upstreamKeys}
-                clientTokens={clientTokens}
-                loadGateway={loadGateway}
-                gatewayFetch={gatewayFetch}
-                selectedBackend={selectedBackend}
-                gatewaySettings={gatewaySettings}
-              />
-            )}
+        {page === 'artifacts' && (
+          <ArtifactsView
+            provider={provider}
+            setProvider={setProvider}
+            forceRefresh={forceRefresh}
+            setForceRefresh={setForceRefresh}
+            zipWorkspace={zipWorkspace}
+            filePath={filePath}
+            setFilePath={setFilePath}
+            fetchFile={fetchFile}
+            fileStatus={fileStatus}
+            artifacts={artifacts}
+            setTab={() => go('sandbox')}
+          />
+        )}
 
-            {tab === 'logs' && (
-              <LogDashboard
-                adminToken={adminToken}
-                clientTokens={clientTokens}
-              />
-            )}
+        {page === 'gateway' && <GatewayPanel {...gatewayPanelProps} section="overview" />}
+        {page === 'keys' && <GatewayPanel {...gatewayPanelProps} section="keys" />}
+        {page === 'tokens' && <GatewayPanel {...gatewayPanelProps} section="tokens" />}
+        {page === 'settings' && <GatewayPanel {...gatewayPanelProps} section="settings" />}
 
-            {tab === 'trace' && (
-              <TraceView
-                output={output}
-                steps={steps}
-                running={running}
-                json={json}
-              />
-            )}
+        {page === 'logs' && (
+          <LogDashboard adminToken={adminToken} clientTokens={clientTokens} />
+        )}
 
-            {tab === 'artifacts' && (
-              <ArtifactsView
-                provider={provider}
-                setProvider={setProvider}
-                forceRefresh={forceRefresh}
-                setForceRefresh={setForceRefresh}
-                zipWorkspace={zipWorkspace}
-                filePath={filePath}
-                setFilePath={setFilePath}
-                fetchFile={fetchFile}
-                fileStatus={fileStatus}
-                artifacts={artifacts}
-                setTab={setTab}
-              />
-            )}
+        {page === 'docs' && (
+          <section className="box markdown">
+            <h3>Antigravity Studio v{APP_VERSION}</h3>
+            <p>本系统以 <b>协议中转站 (Protocol Gateway)</b> 与 <b>独立日志控制台 (Log Dashboard)</b> 为核心，同时集成 Google Interactions 远程沙盒调试能力。</p>
+            <h4>界面结构</h4>
+            <p>
+              WebUI 采用 <b>App Shell + 侧边栏导航 + 功能分页</b>（和 grok2api 一类管理后台相同）：
+              左侧按业务分组，右侧一页一个功能，设置不再和聊天挤在同一屏。
+            </p>
+            <h4>网页沙盒 vs 协议网关</h4>
+            <ul>
+              <li>网页「沙盒任务」从上游 Key 池里<strong>选择一把 Key</strong>，由服务端解密后直连 Gemini Interactions。</li>
+              <li>这条路径<strong>不走</strong> <code>/v1/chat/completions</code> 的 clone / fork / 100k TPM 限额规则。</li>
+              <li>Cursor / Cline / 机器人等下游客户端仍然走协议网关，继续受 TPM、粘性会话和日请求上限约束。</li>
+              <li>浏览器不再保存单独的统一沙盒 Key。</li>
+            </ul>
+            <h4>塞文件</h4>
+            <p>提交任务时可上传任意文件。新建沙盒时写入 <code>environment.sources</code>，落在 <code>/workspace</code>；复用沙盒时会先让 Agent 把文件写进当前环境。</p>
+            <h4>对外模型规范</h4>
+            <p>下游客户端请求时，<code>model</code> 填「运行设置 → 对外模型目录」里添加的名字，<code>/v1/models</code> 也按这个列表返回，没有 <code>{AGENT_ID}/</code> 前缀。</p>
+            <ul>
+              {(gatewaySettings?.gatewayModels || BACKEND_MODELS.map((model) => model.id)).map((id) => (
+                <li key={id}><code>{id}</code></li>
+              ))}
+            </ul>
+            <h4>高可用与 TPM 策略</h4>
+            <p>默认策略是立即 clone（克隆到新 Key）：60 秒窗口、100k 上限、80% 触发比例，粘性会话到达阈值或遭遇 429 时，用不可执行的工具摘要重建上下文并切换到新 Key。也可改为排队等待。这些规则只作用于协议网关，不作用于网页沙盒直连。</p>
+          </section>
+        )}
+      </main>
 
-            {tab === 'docs' && (
-              <section className="box markdown">
-                <h3>Antigravity Studio v{APP_VERSION}</h3>
-                <p>本系统以 <b>协议中转站 (Protocol Gateway)</b> 与 <b>独立日志控制台 (Log Dashboard)</b> 为核心，同时集成 Google Interactions 远程沙盒调试能力。</p>
-                <h4>对外模型规范</h4>
-                <p>下游客户端 (Cursor / Cline / QQ 机器人 / OpenAI SDK / LangChain 等) 请求时，<code>model</code> 填「协议中转 → 对外模型目录」里添加的名字，<code>/v1/models</code> 也按这个列表返回，没有 <code>{AGENT_ID}/</code> 前缀。未在目录里的名字同样会原样写入上游 <code>agent_config.model</code>。</p>
-                <ul>
-                  {(gatewaySettings?.gatewayModels || BACKEND_MODELS.map((model) => model.id)).map((id) => (
-                    <li key={id}><code>{id}</code></li>
-                  ))}
-                </ul>
-                <h4>高可用与 TPM 策略</h4>
-                <p>默认策略是立即 clone（克隆到新 Key）：60 秒窗口、100k 上限、80% 触发比例，粘性会话到达阈值或遭遇 429 时，用不可执行的工具摘要重建上下文并切换到新 Key。也可改为排队等待：只有「本轮预估 + 窗口内已有用量」严格小于 TPM 窗口才立刻上传，否则同一把 Key 上等待腾额度；预计等待超过最长等待仍 clone。fork 仍是下游历史对不上时的分叉，和 clone 不是一回事。会话哈希可配置忽略注入块，避免插件记忆导致假 fork。上游 Internal error 连续命中后熔断并回 HTTP 400，避免 SDK 把 500 自动重试成风暴。每把上游 Key 显示今日调用次数与可编辑日上限（默认 100），达到上限或收到 Google `limit: 100` 时报错后停用到洛杉矶午夜（与 Google AI Studio RPD 一致）。</p>
-              </section>
-            )}
-          </div>
-        </main>
-      </div>
-
-      {/* Browser API Key Modal */}
-      {keyModal && (
-        <div className="modal-backdrop" onClick={() => setKeyModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>沙盒调试 API Key</h3>
-            <p className="hint">只用于本 WebUI 面板直接调用沙盒任务，保存在浏览器 localStorage。下游中转站的 Key 请在「协议中转」面板配置到服务端。</p>
-            <input className="input mono" type="password" value={keyDraft} onChange={(e) => setKeyDraft(e.target.value)} placeholder="Gemini API Key" />
-            <div className="modal-actions">
-              <button className="btn" onClick={() => setKeyModal(false)}>取消</button>
-              <button className="btn btn-primary" style={{ width: 'auto' }} onClick={saveKey}>保存</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Error Details Modal */}
       {errorOpen && error && (
         <div className="modal-backdrop" onClick={() => setErrorOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -580,7 +650,7 @@ export default function App() {
             <pre className="example">{json(error.err)}</pre>
             <pre className="example">{json(error.request || lastRequest)}</pre>
             <div className="modal-actions">
-              <button className="btn" onClick={() => { setErrorOpen(false); setTab('logs'); }}>去日志控制台</button>
+              <button className="btn" onClick={() => { setErrorOpen(false); go('logs'); }}>去日志控制台</button>
               <button className="btn" onClick={() => setErrorOpen(false)}>关闭</button>
             </div>
           </div>
@@ -589,4 +659,3 @@ export default function App() {
     </div>
   );
 }
-

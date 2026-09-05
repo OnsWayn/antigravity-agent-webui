@@ -12,8 +12,14 @@ export default function GatewayPanel({
   loadGateway,
   gatewayFetch,
   selectedBackend,
-  gatewaySettings
+  gatewaySettings,
+  section = 'all',
+  useProxy,
+  setUseProxy,
+  proxyUrl,
+  setProxyUrl
 }) {
+  const show = (id) => section === 'all' || section === id;
   const [keyName, setKeyName] = useState('');
   const [keyValue, setKeyValue] = useState('');
   const [keyProxy, setKeyProxy] = useState('');
@@ -186,7 +192,7 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
 
   return (
     <div className="gateway-panel">
-      {/* 1. Status & Admin Token Card */}
+      {show('overview') && (
       <section className="box">
         <div className="box-head">🌐 协议中转站概览</div>
         <p className="hint">支持 OpenAI <code>/v1/chat/completions</code>、<code>/v1/responses</code> 及 Google <code>:generateContent</code> 协议代理，统一接入 Antigravity 沙盒 Agent。</p>
@@ -208,8 +214,9 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
         </div>
         {gatewayError && <p className="status-bad" style={{ marginTop: 8 }}>{gatewayError}</p>}
       </section>
+      )}
 
-      {/* 2. Upstream Keys Management */}
+      {show('keys') && (
       <section className="box">
         <div className="box-head">🔑 上游 Gemini API Key 池</div>
         <p className="hint">配置的 Key 以 AES-256-GCM 加密保存在服务端，界面只显示后缀、不可复制。支持负载均衡、TPM 感知避让、日请求上限与 429 故障自动平滑迁移沙盒。</p>
@@ -292,7 +299,42 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
           ))}
         </div>
       </section>
+      )}
 
+      {show('settings') && (
+      <>
+      <section className="box">
+        <div className="box-head">管理 Token 与网页代理</div>
+        <p className="hint">管理 Token 用于读取 Key 池、发行下游 Token，以及网页沙盒按 Key 直连。代理仅作用于网页沙盒直连；协议网关仍使用各 Key 自己的代理。</p>
+        <label className="label">GATEWAY_ADMIN_TOKEN</label>
+        <div className="row">
+          <input
+            className="input mono grow"
+            type="password"
+            value={adminToken}
+            onChange={(e) => { setAdminToken(e.target.value); storageSet('antigravity_gateway_admin_token', e.target.value); }}
+            placeholder="管理 Token"
+          />
+          <button className="btn" onClick={loadGateway}>保存/刷新</button>
+        </div>
+        <label className="check" style={{ marginTop: 10 }}>
+          <input
+            type="checkbox"
+            checked={Boolean(useProxy)}
+            onChange={(e) => { setUseProxy?.(e.target.checked); storageSet('antigravity_use_proxy', e.target.checked); }}
+          />
+          <span>网页沙盒启用 HTTP/HTTPS 代理（覆盖所选 Key 的独立代理）</span>
+        </label>
+        {useProxy && (
+          <input
+            className="input mono"
+            style={{ marginTop: 6 }}
+            value={proxyUrl}
+            onChange={(e) => { setProxyUrl?.(e.target.value); storageSet('antigravity_proxy_url', e.target.value); }}
+            placeholder="http://127.0.0.1:7890"
+          />
+        )}
+      </section>
       <section className="box">
         <div className="box-head">📦 对外模型目录</div>
         <p className="hint">
@@ -484,8 +526,10 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
           同一会话连续命中 Internal error 达到该次数后，后续请求不再打上游，直接 HTTP 400。成功或 fork 新链后清零。
         </p>
       </section>
+      </>
+      )}
 
-      {/* 3. Downstream Token Management (Module 5) */}
+      {show('tokens') && (
       <section className="box">
         <div className="box-head">🎫 下游 Client Token 发行与精细控制</div>
         <p className="hint">为 Cursor、Cline、QQ 机器人等不同客户端分发专属 Token。密钥会一直显示，可随时复制。</p>
@@ -602,9 +646,9 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
           ))}
         </div>
       </section>
+      )}
 
-      {/* Edit Token Modal */}
-      {editingToken && (
+      {show('tokens') && editingToken && (
         <div className="modal-backdrop" onClick={() => setEditingToken(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>编辑 Token：{editingToken.name}</h3>
@@ -645,11 +689,12 @@ curl ${origin}/v1beta/models/${encodeURIComponent(model)}:generateContent \\
         </div>
       )}
 
-      {/* 4. Call Examples */}
+      {show('overview') && (
       <section className="box">
         <div className="box-head">💻 客户端调用示例 (OpenAI / Responses / Gemini)</div>
         <pre className="example">{example}</pre>
       </section>
+      )}
     </div>
   );
 }

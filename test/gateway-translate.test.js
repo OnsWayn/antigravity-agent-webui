@@ -253,10 +253,9 @@ test('model catalog lists added names without the Antigravity prefix', () => {
   const { listGatewayModels } = require('../gateway/models');
   const ids = listGatewayModels().map((model) => model.id);
   assert.deepEqual(ids, [
+    'gemini-3.8-flash',
     'gemini-3.7-flash',
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
-    'gemini-3.5-flash-lite'
+    'gemini-3.6-flash'
   ]);
   assert.deepEqual(
     listGatewayModels({ catalog: ['gemini-3.8-flash', 'gemini-3.8-flash'] }).map((model) => model.id),

@@ -6,7 +6,7 @@ A high-performance **OpenAI / Gemini protocol gateway** and **management dashboa
 
 > Unofficial community project. Antigravity managed agents and the Gemini Interactions API are preview features and may change without notice.
 
-Current version: **1.7.7** · Node.js **22.5+** · License **Apache-2.0**
+Current version: **1.8.0** · Node.js **22.5+** · License **Apache-2.0**
 
 > **Free-tier note.** Gemini / Antigravity free quota is about **100,000 TPM**. Use it as a lightweight chat API, not a high-throughput agent loop. On downstream tokens, turn off the three sandbox tools (code execution, Google Search, URL context) and let the caller's agent framework run tools instead.
 >
@@ -69,7 +69,7 @@ Optional: copy `.env.example` to `.env` and adjust the port, database, cache, or
 npm start
 ```
 
-Open <http://localhost:3000> and select **Configure API Key** in the top-right corner.
+Open <http://localhost:3000>. The WebUI is an App Shell with a left sidebar: dashboard, sandbox, artifacts, keys, tokens, logs, and settings. Add upstream Gemini keys under **上游 Key**, set `GATEWAY_ADMIN_TOKEN` in **运行设置**, then pick a key on the sandbox page. Web sandbox calls go straight to Gemini Interactions and do **not** use the gateway clone / fork / 100k TPM rules.
 
 The WebUI is a React app. For local UI development with hot reload:
 
@@ -77,7 +77,7 @@ The WebUI is a React app. For local UI development with hot reload:
 npm run dev
 ```
 
-This starts the API on port 3000 and Vite on port 5173. Production static files are built into `public/` with `npm run build`. The key is stored only in the current browser's `localStorage` and is never written to SQLite.
+This starts the API on port 3000 and Vite on port 5173. Production static files are built into `public/` with `npm run build`. The admin token and selected sandbox key id stay in the current browser's `localStorage`; raw Gemini keys stay encrypted on the server.
 
 If the server was already running before a code update, restart Node.js and perform a hard refresh in the browser.
 
@@ -203,10 +203,9 @@ Conversation state uses `previous_interaction_id`. When the request is a proven 
 
 The gateway does **not** expose the Gemini model catalog on the API key. `GET /v1/models` returns the names you added (defaults below). Clients should send those names, not `antigravity-preview-05-2026/...`:
 
+- `gemini-3.8-flash`
 - `gemini-3.7-flash` (default when the request omits `model`)
 - `gemini-3.6-flash`
-- `gemini-3.5-flash`
-- `gemini-3.5-flash-lite`
 
 Prefixed ids such as `antigravity-preview-05-2026/gemini-3.7-flash` still work; the prefix is stripped before the upstream call.
 
